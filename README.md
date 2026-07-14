@@ -9,6 +9,7 @@ src/
 ├── core/            # Types, PlatformConnector interface, connector registry
 ├── platforms/       # Platform adapters (grab/, foodpanda/, ...)
 │   └── grab/        # Playwright auth + API client + normalizer
+├── mappers/         # UnifiedOrder → @posx/core Invoice (docs/xpos-invoice-mapping.md)
 ├── db/              # Drizzle schema, repo layer
 ├── scheduler/       # node-cron schedules
 ├── api/             # Fastify REST API
