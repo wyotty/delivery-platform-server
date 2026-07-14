@@ -3,6 +3,9 @@ dist/
 data/delivery.db
 data/delivery.db-wal
 data/delivery.db-shm
-data/*.json
 .env
 .grab_cookies.json
+
+# Large raw data exports (too big for repo)
+data/sample-grab-july.json
+data/sample-grab-jun-16.json

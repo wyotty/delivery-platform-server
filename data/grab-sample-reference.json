@@ -1,0 +1,62 @@
+{
+  "merchant": "Coffee & Bánh Mì Đong Đầy",
+  "account": "nguyenluu3108",
+  "platform": "grab",
+  "timezone": "+07:00",
+  "data_available_from": "2026-06-16",
+  "total_orders": 880,
+  "date_ranges_fetched": [
+    {
+      "from": "2026-06-16",
+      "to": "2026-06-30",
+      "orders": 466
+    },
+    {
+      "from": "2026-07-01",
+      "to": "2026-07-14",
+      "orders": 414
+    }
+  ],
+  "field_definitions": {
+    "ID": "Grab unique order ID (format: 001684995068-C8CACALARUMHPE)",
+    "bookingCode": "Booking reference code (format: A-9J73HL8GWNW6AV)",
+    "displayID": "Store-local display ID (format: GF-448)",
+    "deliveryStatus": "One of: COMPLETED, ORDER_EXECUTING, FAILED",
+    "orderEarningsInMinorUnit": "Net earnings in minor unit (e.g. 312000 = 312,000 VND)",
+    "currency": "{code, symbol, exponent, exponentUnit}",
+    "priceDisplay": "Display price string (e.g. \"312.000\")",
+    "createdAt": "Order creation timestamp (ISO 8601 UTC)",
+    "updatedAt": "Order last updated timestamp (ISO 8601 UTC)",
+    "hasPromo": "Order had promotion applied",
+    "isTakeawayOrder": "Takeaway vs delivery",
+    "isScheduledOrder": "Pre-scheduled order",
+    "isLargeOrder": "Large/bulk order flag",
+    "isAcceptedByAA": "Accepted by auto-assign",
+    "isAdsMarketingAttributed": "Attributed to ads/marketing",
+    "isPaxNewCustomer": "Customer was new",
+    "isPreparationTaskDelayed": "Kitchen prep was delayed",
+    "preparationTaskDelayedByMin": "Delay in minutes",
+    "compensationStatus": "0=no compensation, >0?",
+    "cancelRole": "Who cancelled (empty string if not cancelled)",
+    "cancelledAt": "Cancellation timestamp (null if not cancelled)",
+    "cancelledOriginalPriceDisplay": "Original price before cancellation",
+    "payMerchant": "Merchant payment flag",
+    "orderFlags": "Bitmask flags (int)",
+    "preparationTaskID": "Prep task tracking ID",
+    "chatroomInfo": "{roomID, status} - chat with customer",
+    "isTH5050Order": "TH 50/50 promo flag",
+    "isOrderEdited": "Order was edited after placement"
+  },
+  "field_mapping_to_unified_order": {
+    "platformOrderId": "ID",
+    "merchantId": "fixed: dong-day",
+    "status": "deliveryStatus → completed/cancelled/refunded/other",
+    "grossAmountMinor": "orderEarningsInMinorUnit (currently same as net)",
+    "netAmountMinor": "orderEarningsInMinorUnit",
+    "currency": "currency.code",
+    "orderedAt": "createdAt (convert to UTC Date)",
+    "platformTimezone": "fixed: +07:00",
+    "updatedAt": "updatedAt",
+    "rawJson": "full statement object"
+  }
+}

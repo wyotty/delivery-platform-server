@@ -1,0 +1,118 @@
+{
+  "statements": [
+    {
+      "ID": "001684995068-C8CACALARUMHPE",
+      "currency": {
+        "code": "VND",
+        "symbol": "₫",
+        "exponent": "0",
+        "exponentUnit": 0
+      },
+      "orderEarningsInMinorUnit": 312000,
+      "deliveryStatus": "ORDER_EXECUTING",
+      "createdAt": "2026-07-14T06:22:29Z",
+      "bookingCode": "A-9J73HL8GWNW6AV",
+      "priceDisplay": "312.000",
+      "updatedAt": "2026-07-14T06:40:13.122773Z",
+      "displayID": "GF-448",
+      "isAcceptedByAA": true,
+      "hasPromo": false,
+      "isTakeawayOrder": false,
+      "isScheduledOrder": false,
+      "isLargeOrder": false,
+      "cancelledOriginalPriceDisplay": "312.000",
+      "cancelRole": "",
+      "isOrderEdited": false,
+      "payMerchant": false,
+      "orderFlags": 4035792614123897000,
+      "preparationTaskID": "001684995068-C8CACALARUMHPE-PREP-C8CACALBR4MHPE",
+      "isAdsMarketingAttributed": true,
+      "isPaxNewCustomer": false,
+      "isPreparationTaskDelayed": false,
+      "preparationTaskDelayedByMin": 0,
+      "compensationStatus": 0,
+      "cancelledAt": null,
+      "isTH5050Order": false,
+      "chatroomInfo": {
+        "roomID": "",
+        "status": 0
+      }
+    },
+    {
+      "ID": "00135171741-C8CAA8ECSFUTEA",
+      "currency": {
+        "code": "VND",
+        "symbol": "₫",
+        "exponent": "0",
+        "exponentUnit": 0
+      },
+      "orderEarningsInMinorUnit": 52000,
+      "deliveryStatus": "COMPLETED",
+      "createdAt": "2026-07-14T05:44:51Z",
+      "bookingCode": "A-9J7W3D7GWVSRAV",
+      "priceDisplay": "52.000",
+      "updatedAt": "2026-07-14T06:05:12.688772Z",
+      "displayID": "GF-404",
+      "isAcceptedByAA": true,
+      "hasPromo": true,
+      "isTakeawayOrder": false,
+      "isScheduledOrder": false,
+      "isLargeOrder": false,
+      "cancelledOriginalPriceDisplay": "52.000",
+      "cancelRole": "",
+      "isOrderEdited": false,
+      "payMerchant": false,
+      "orderFlags": 4035788216077388000,
+      "preparationTaskID": "00135171741-C8CAA8ECSFUTEA-PREP-C8CAA8EDTJBTEA",
+      "isAdsMarketingAttributed": false,
+      "isPaxNewCustomer": false,
+      "isPreparationTaskDelayed": false,
+      "preparationTaskDelayedByMin": 0,
+      "compensationStatus": 0,
+      "cancelledAt": null,
+      "isTH5050Order": false,
+      "chatroomInfo": {
+        "roomID": "",
+        "status": 0
+      }
+    },
+    {
+      "ID": "001560247180-C8CAA3DYEJ6FBA",
+      "currency": {
+        "code": "VND",
+        "symbol": "₫",
+        "exponent": "0",
+        "exponentUnit": 0
+      },
+      "orderEarningsInMinorUnit": 366000,
+      "deliveryStatus": "COMPLETED",
+      "createdAt": "2026-07-14T05:21:23Z",
+      "bookingCode": "A-9J6TULUWWFOOAV",
+      "priceDisplay": "366.000",
+      "updatedAt": "2026-07-14T06:01:07.8323Z",
+      "displayID": "GF-344",
+      "isAcceptedByAA": true,
+      "hasPromo": false,
+      "isTakeawayOrder": false,
+      "isScheduledOrder": false,
+      "isLargeOrder": false,
+      "cancelledOriginalPriceDisplay": "366.000",
+      "cancelRole": "",
+      "isOrderEdited": false,
+      "payMerchant": false,
+      "orderFlags": 4035792614123897000,
+      "preparationTaskID": "001560247180-C8CAA3DYEJ6FBA-PREP-C8CAA3DZEU6FBA",
+      "isAdsMarketingAttributed": false,
+      "isPaxNewCustomer": true,
+      "isPreparationTaskDelayed": false,
+      "preparationTaskDelayedByMin": 0,
+      "compensationStatus": 0,
+      "cancelledAt": null,
+      "isTH5050Order": false,
+      "chatroomInfo": {
+        "roomID": "",
+        "status": 0
+      }
+    }
+  ]
+}
