@@ -9,3 +9,4 @@ data/delivery.db-shm
 # Large raw data exports (too big for repo)
 data/sample-grab-july.json
 data/sample-grab-jun-16.json
+drizzle/

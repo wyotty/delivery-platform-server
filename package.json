@@ -1,0 +1,45 @@
+{
+  "name": "delivery-platform-server",
+  "version": "1.0.0",
+  "description": "Unified server aggregating order data from food delivery platforms",
+  "scripts": {
+    "dev": "tsx watch src/cli.ts",
+    "fetch": "tsx src/cli.ts fetch",
+    "start": "tsx src/index.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "lint": "tsc --noEmit",
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.7.1",
+  "devDependencies": {
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "26.1.1",
+    "drizzle-kit": "0.31.10",
+    "tsx": "4.23.1",
+    "typescript": "7.0.2"
+  },
+  "dependencies": {
+    "@fastify/cors": "11.3.0",
+    "better-sqlite3": "12.11.1",
+    "dotenv": "17.4.2",
+    "drizzle-orm": "0.45.2",
+    "fastify": "5.10.0",
+    "grammy": "1.44.0",
+    "node-cron": "4.6.0",
+    "pino": "10.3.1",
+    "pino-pretty": "13.1.3",
+    "playwright": "1.61.1",
+    "zod": "4.4.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  },
+  "type": "module"
+}
