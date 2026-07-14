@@ -36,21 +36,28 @@ async function main() {
       process.exit(1);
     }
 
-    const connector = getConnector(platform);
+    if (accountRow.platform !== platform) {
+      console.error(`Account ${accountId} belongs to platform '${accountRow.platform}', not '${platform}'.`);
+      process.exit(1);
+    }
+
     const range: DateRange = { from, to };
     const startedAt = new Date().toISOString();
 
     logger.info({ platform, accountId, from, to }, 'Fetching orders');
 
     try {
+      const connector = getConnector(platform);
+      // ponytail: env prefix from platform name; key off credentialKey when one platform needs multiple credential sets
+      const envPrefix = accountRow.platform.toUpperCase();
       const account: PlatformAccount = {
         id: accountRow.id,
         platform: accountRow.platform,
         merchantId: accountRow.merchantId,
         merchantName: accountRow.label,
         credentials: {
-          username: process.env.GRAB_USERNAME || '',
-          password: process.env.GRAB_PASSWORD || '',
+          username: process.env[`${envPrefix}_USERNAME`] || '',
+          password: process.env[`${envPrefix}_PASSWORD`] || '',
         },
         timezone: accountRow.timezone,
         config: JSON.parse(accountRow.config),
@@ -69,10 +76,11 @@ async function main() {
         completedAt: new Date().toISOString(),
       });
 
-      const completed = orders.filter(o => o.status === 'completed').length;
-      const totalRevenue = orders.reduce((s, o) => s + o.netAmountMinor, 0);
-      logger.info({ totalOrders: orders.length, completed, revenue: totalRevenue / 1000 }, 'Done');
-      console.log(JSON.stringify({ total_orders: orders.length, completed, revenue_minor: totalRevenue }, null, 2));
+      // Revenue = completed orders only (cancelled Grab statements can still carry earnings)
+      const completedOrders = orders.filter(o => o.status === 'completed');
+      const totalRevenue = completedOrders.reduce((s, o) => s + o.netAmountMinor, 0);
+      logger.info({ totalOrders: orders.length, completed: completedOrders.length, revenueMinor: totalRevenue }, 'Done');
+      console.log(JSON.stringify({ total_orders: orders.length, completed: completedOrders.length, revenue_minor: totalRevenue }, null, 2));
     } catch (err: any) {
       logFetchRun({
         platform,
@@ -95,4 +103,7 @@ async function main() {
   }
 }
 
-main();
+main().catch(err => {
+  logger.error({ err }, 'Fatal');
+  process.exit(1);
+});

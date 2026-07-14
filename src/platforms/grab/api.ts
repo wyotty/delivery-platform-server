@@ -63,7 +63,11 @@ export async function fetchDailyReport(
     const data = await resp.json();
     const statements: GrabStatement[] = data.statements || [];
     allStatements.push(...statements);
-    if (!data.hasMore) break;
+    // Driver-independent stop: a short page is the last page. The captured
+    // envelope (data/sample-grab-3.json) has no hasMore field, so only trust
+    // hasMore when it's explicitly false — `!undefined` would stop at page 0.
+    if (statements.length < pageSize) break;
+    if (data.hasMore === false) break;
     pageIndex++;
   }
 

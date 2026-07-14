@@ -39,9 +39,10 @@ export class GrabConnector implements PlatformConnector {
       if (cached && await this.auth.validateSession(cached)) {
         return 'valid';
       }
-      // Attempt re-login
+      // Attempt re-login — persist the session so the next fetchOrders reuses it
       try {
-        await this.auth.login(account);
+        const s = await this.auth.login(account);
+        await sessionStore.set(account.id, s);
         return 'valid';
       } catch {
         return 'needs_human';

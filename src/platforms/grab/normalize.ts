@@ -12,7 +12,8 @@ export function normalizeOrder(
   const status = isCancelled ? 'cancelled'
     : statement.deliveryStatus === 'COMPLETED' ? 'completed'
     : statement.deliveryStatus === 'FAILED' ? 'cancelled'
-    : 'in_progress'; // ORDER_EXECUTING → in_progress
+    : statement.deliveryStatus === 'ORDER_EXECUTING' ? 'in_progress'
+    : 'other'; // unknown/new Grab statuses surface as 'other' (platformStatus keeps the raw value)
 
   const netMinor = statement.orderEarningsInMinorUnit ?? 0;
   const currency = statement.currency?.code ?? 'VND';

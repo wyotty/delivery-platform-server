@@ -21,6 +21,12 @@ test('ORDER_EXECUTING maps to in_progress', () => {
   assert.equal(norm(executing).status, 'in_progress');
 });
 
+test('unknown deliveryStatus maps to other, not in_progress', () => {
+  const u = norm({ ...completed, deliveryStatus: 'SOME_NEW_STATUS' });
+  assert.equal(u.status, 'other');
+  assert.equal(u.platformStatus, 'SOME_NEW_STATUS');
+});
+
 test('FAILED maps to cancelled', () => {
   // fixture set has no FAILED order — derive one from a real fixture
   assert.equal(norm({ ...completed, deliveryStatus: 'FAILED' }).status, 'cancelled');
