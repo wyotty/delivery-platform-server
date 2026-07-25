@@ -11,9 +11,8 @@ src/
 │   └── grab/        # Playwright auth + API client + normalizer
 ├── mappers/         # UnifiedOrder → @posx/core Invoice (docs/xpos-invoice-mapping.md)
 ├── db/              # Drizzle schema, repo layer
-├── api/             # Fastify REST API
 ├── notify/          # Telegram (grammY), email, etc.
-├── config/          # Zod-validated config loader
+├── api.ts           # Fastify REST API
 ├── fetch-job.ts     # Shared fetch flow (CLI + scheduler)
 ├── scheduler.ts     # node-cron daily fetches
 ├── index.ts         # Server entry (scheduler daemon)
@@ -35,6 +34,18 @@ skips that account until you import a session captured from browser devtools:
 
 ```bash
 pnpm cli import-session grab-dong-day session.json
+```
+
+## API
+
+`pnpm start` serves a REST API on `PORT` (default 3000). Date params are business
+dates — calendar days in each merchant's timezone.
+
+```
+GET /health
+GET /summary?from=2026-07-01&to=2026-07-14        # cross-platform totals (revenue = completed only)
+GET /orders?from=&to=&platform=&status=&limit=    # newest first; range optional
+GET /fetch-runs?limit=20                          # did last night's fetch work?
 ```
 
 ## Language

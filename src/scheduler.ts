@@ -2,6 +2,7 @@
 import cron from 'node-cron';
 import pino from 'pino';
 import { AuthError, DateRange, SessionStore } from './core/types.js';
+import { dateInTz } from './core/dates.js';
 import { DbSessionStore, getSessionState, listAccounts } from './db/repo.js';
 import { runFetchJob } from './fetch-job.js';
 
@@ -9,10 +10,9 @@ const logger = pino({ transport: { target: 'pino-pretty' } });
 
 /** Business-date range in the merchant's timezone: [today - trailingDays, today]. */
 export function trailingRange(timezone: string, trailingDays: number, now = new Date()): DateRange {
-  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: timezone }); // en-CA formats as YYYY-MM-DD
   return {
-    from: fmt.format(new Date(now.getTime() - trailingDays * 86_400_000)),
-    to: fmt.format(now),
+    from: dateInTz(new Date(now.getTime() - trailingDays * 86_400_000), timezone),
+    to: dateInTz(now, timezone),
   };
 }
 

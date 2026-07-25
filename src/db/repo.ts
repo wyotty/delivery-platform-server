@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
-import { eq } from 'drizzle-orm';
+import { and, desc, eq, gte, lte } from 'drizzle-orm';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import * as schema from './schema.js';
@@ -106,6 +106,56 @@ export class DbSessionStore implements SessionStore {
       .where(eq(schema.platformSessions.accountId, accountId))
       .run();
   }
+}
+
+export interface OrderQuery {
+  /** UTC instant bounds on orderedAt (ISO strings — lexicographic compare works for Zulu format) */
+  fromUtc?: string;
+  toUtc?: string;
+  platform?: string;
+  accountId?: string;
+  status?: UnifiedOrder['status'];
+  limit?: number;
+}
+
+/** List orders newest-first. rawJson excluded — it's a blob, fetch by id if ever needed. */
+export function listOrders(q: OrderQuery) {
+  const conds = [
+    q.fromUtc ? gte(schema.orders.orderedAt, q.fromUtc) : undefined,
+    q.toUtc ? lte(schema.orders.orderedAt, q.toUtc) : undefined,
+    q.platform ? eq(schema.orders.platform, q.platform) : undefined,
+    q.accountId ? eq(schema.orders.accountId, q.accountId) : undefined,
+    q.status ? eq(schema.orders.status, q.status) : undefined,
+  ].filter(c => c !== undefined);
+
+  const base = db.select({
+    id: schema.orders.id,
+    platform: schema.orders.platform,
+    platformOrderId: schema.orders.platformOrderId,
+    accountId: schema.orders.accountId,
+    merchantId: schema.orders.merchantId,
+    status: schema.orders.status,
+    platformStatus: schema.orders.platformStatus,
+    grossAmountMinor: schema.orders.grossAmountMinor,
+    netAmountMinor: schema.orders.netAmountMinor,
+    currency: schema.orders.currency,
+    orderedAt: schema.orders.orderedAt,
+    platformTimezone: schema.orders.platformTimezone,
+    updatedAt: schema.orders.updatedAt,
+  })
+    .from(schema.orders)
+    .where(conds.length ? and(...conds) : undefined)
+    .orderBy(desc(schema.orders.orderedAt));
+
+  return (q.limit ? base.limit(q.limit) : base).all();
+}
+
+export function listFetchRuns(limit = 20) {
+  return db.select()
+    .from(schema.fetchRuns)
+    .orderBy(desc(schema.fetchRuns.startedAt))
+    .limit(limit)
+    .all();
 }
 
 // ===== Session state (needs_human gating for the scheduler) =====
