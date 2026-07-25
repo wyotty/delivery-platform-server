@@ -108,11 +108,43 @@ export class DbSessionStore implements SessionStore {
   }
 }
 
+// ===== Session state (needs_human gating for the scheduler) =====
+
+export function getSessionState(accountId: string): 'valid' | 'expired' | 'needs_human' | null {
+  const row = db.select({ state: schema.platformSessions.state })
+    .from(schema.platformSessions)
+    .where(eq(schema.platformSessions.accountId, accountId))
+    .get();
+  return row?.state ?? null;
+}
+
+/** Auth is broken beyond auto-recovery — scheduler skips this account until a human re-auths (CLI import-session). */
+export function markSessionNeedsHuman(accountId: string) {
+  db.insert(schema.platformSessions)
+    .values({
+      accountId,
+      sessionJson: '{}', // no valid session exists; fetchedAt 0 = treated as expired everywhere
+      state: 'needs_human',
+      fetchedAt: 0,
+    })
+    .onConflictDoUpdate({
+      target: schema.platformSessions.accountId,
+      set: { state: 'needs_human' },
+    })
+    .run();
+}
+
 // ===== Platform accounts =====
+
+export type PlatformAccountRow = typeof schema.platformAccounts.$inferSelect;
 
 export function getAccount(accountId: string) {
   return db.select()
     .from(schema.platformAccounts)
     .where(eq(schema.platformAccounts.id, accountId))
     .get();
+}
+
+export function listAccounts(): PlatformAccountRow[] {
+  return db.select().from(schema.platformAccounts).all();
 }

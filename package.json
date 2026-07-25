@@ -4,6 +4,7 @@
   "description": "Unified server aggregating order data from food delivery platforms",
   "scripts": {
     "dev": "tsx watch src/cli.ts",
+    "cli": "tsx src/cli.ts",
     "fetch": "tsx src/cli.ts fetch",
     "start": "tsx src/index.ts",
     "db:generate": "drizzle-kit generate",

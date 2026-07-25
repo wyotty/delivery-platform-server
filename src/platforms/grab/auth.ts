@@ -1,5 +1,5 @@
 import { chromium } from 'playwright';
-import { PlatformAccount, SessionStore } from '../../core/types.js';
+import { AuthError, PlatformAccount, SessionStore } from '../../core/types.js';
 
 export interface GrabSession {
   cookies: Record<string, string>;
@@ -43,7 +43,7 @@ export class GrabAuthenticator {
   async login(account: PlatformAccount): Promise<GrabSession> {
     const username = account.credentials['username'];
     const password = account.credentials['password'];
-    if (!username || !password) throw new Error('Grab credentials missing: username/password');
+    if (!username || !password) throw new AuthError('needs_human', 'Grab credentials missing: username/password');
 
     const { browser, context, page } = await this.launchBrowser();
     try {
@@ -65,7 +65,9 @@ export class GrabAuthenticator {
 
       const currentUrl = page.url();
       if (!currentUrl.includes('/dashboard') && !currentUrl.includes('/portal')) {
-        throw new Error(`Grab login failed, URL: ${currentUrl}`);
+        // Login flow completed but didn't land on the portal: bad password, CAPTCHA, or OTP.
+        // AuthError = "don't retry, page a human"; Playwright timeouts stay plain errors (retryable).
+        throw new AuthError('needs_human', `Grab login failed, URL: ${currentUrl}`);
       }
 
       const allCookies = await context.cookies();

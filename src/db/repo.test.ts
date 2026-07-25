@@ -9,7 +9,7 @@ import { UnifiedOrder } from '../core/types.js';
 const tmp = mkdtempSync(join(tmpdir(), 'delivery-test-'));
 process.env.DB_PATH = join(tmp, 'test.db');
 
-const { db, upsertOrders, DbSessionStore } = await import('./repo.js');
+const { db, upsertOrders, DbSessionStore, getSessionState, markSessionNeedsHuman } = await import('./repo.js');
 const { runMigrations } = await import('./migrate.js');
 const schema = await import('./schema.js');
 
@@ -71,4 +71,20 @@ test('DbSessionStore round-trips, overwrites, and removes', async () => {
 
   await store.remove('acct-1');
   assert.equal(await store.get('acct-1'), null);
+});
+
+test('needs_human lifecycle: mark without session row, recover via set()', async () => {
+  const store = new DbSessionStore();
+  assert.equal(getSessionState('acct-1'), null); // no session row yet
+
+  markSessionNeedsHuman('acct-1'); // must work even when login never succeeded (no row)
+  assert.equal(getSessionState('acct-1'), 'needs_human');
+
+  markSessionNeedsHuman('acct-1'); // idempotent on existing row
+  assert.equal(getSessionState('acct-1'), 'needs_human');
+
+  await store.set('acct-1', { cookies: {}, fetchedAt: 1 }); // import-session / fresh login
+  assert.equal(getSessionState('acct-1'), 'valid'); // scheduler resumes the account
+
+  await store.remove('acct-1');
 });

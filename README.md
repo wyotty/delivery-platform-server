@@ -11,10 +11,12 @@ src/
 │   └── grab/        # Playwright auth + API client + normalizer
 ├── mappers/         # UnifiedOrder → @posx/core Invoice (docs/xpos-invoice-mapping.md)
 ├── db/              # Drizzle schema, repo layer
-├── scheduler/       # node-cron schedules
 ├── api/             # Fastify REST API
 ├── notify/          # Telegram (grammY), email, etc.
 ├── config/          # Zod-validated config loader
+├── fetch-job.ts     # Shared fetch flow (CLI + scheduler)
+├── scheduler.ts     # node-cron daily fetches
+├── index.ts         # Server entry (scheduler daemon)
 └── cli.ts           # CLI entry point
 ```
 
@@ -23,7 +25,16 @@ src/
 ```bash
 pnpm install
 cp .env.example .env   # fill credentials
-pnpm fetch grab 2026-07-14
+pnpm db:migrate && npx tsx scripts/seed-merchants.ts
+pnpm fetch grab grab-dong-day 2026-07-14   # one-off fetch
+pnpm start                                 # scheduler daemon (SCHEDULE_CRON, default 06:30 daily)
+```
+
+If a fetch fails with `needs_human` (login broken — CAPTCHA/OTP/bad password), the scheduler
+skips that account until you import a session captured from browser devtools:
+
+```bash
+pnpm cli import-session grab-dong-day session.json
 ```
 
 ## Language
