@@ -5,8 +5,13 @@
 // and apply the exact per-row business-date filter in JS.
 import Fastify, { FastifyBaseLogger } from 'fastify';
 import cors from '@fastify/cors';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { dateInTz } from './core/dates.js';
 import { listFetchRuns, listOrders, OrderQuery } from './db/repo.js';
+
+const dashboardPath = join(dirname(fileURLToPath(import.meta.url)), 'dashboard.html');
 
 const DAY_MS = 86_400_000;
 const DATE_PATTERN = '^\\d{4}-\\d{2}-\\d{2}$';
@@ -30,6 +35,9 @@ function withBusinessDate(rows: OrderRow[], from: string, to: string) {
 export async function buildApi(logger: boolean | { transport: { target: string } } = { transport: { target: 'pino-pretty' } }) {
   const app = Fastify({ logger: logger as FastifyBaseLogger | boolean });
   await app.register(cors); // permissive default — the Phase 6 dashboard reads this API
+
+  // ponytail: readFileSync per request — dev-refresh friendly, file is tiny; @fastify/static if assets multiply
+  app.get('/', async (_req, reply) => reply.type('text/html; charset=utf-8').send(readFileSync(dashboardPath, 'utf8')));
 
   app.get('/health', async () => ({ ok: true }));
 

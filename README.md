@@ -42,6 +42,7 @@ pnpm cli import-session grab-dong-day session.json
 dates — calendar days in each merchant's timezone.
 
 ```
+GET /                                             # dashboard (KPI tiles + orders table, light/dark)
 GET /health
 GET /summary?from=2026-07-01&to=2026-07-14        # cross-platform totals (revenue = completed only)
 GET /orders?from=&to=&platform=&status=&limit=    # newest first; range optional

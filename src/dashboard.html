@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Delivery ops</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7; --surface: #fcfcfb;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --border: rgba(11, 11, 11, 0.10);
+    --good: #0ca30c; --warn: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface: #1a1a19;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --border: rgba(255, 255, 255, 0.10);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --border: rgba(255, 255, 255, 0.10);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 24px 20px 48px; }
+
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0; }
+  h2 { font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 28px 0 8px; }
+
+  .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .filters input[type="date"] {
+    font: inherit; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--border); border-radius: 8px; padding: 5px 8px;
+  }
+  .filters .sep { color: var(--muted); }
+  .chip {
+    font: inherit; color: var(--ink-2); background: transparent;
+    border: 1px solid var(--border); border-radius: 999px; padding: 5px 12px; cursor: pointer;
+  }
+  .chip:hover { background: var(--surface); }
+  .chip[aria-pressed="true"] { color: var(--ink); background: var(--surface); border-color: var(--grid); font-weight: 600; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .tile .label { color: var(--ink-2); font-size: 12.5px; }
+  .tile .value { font-size: 28px; font-weight: 600; margin-top: 2px; overflow-wrap: anywhere; }
+  .tile .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 14px; white-space: nowrap; }
+  th { color: var(--muted); font-size: 12px; font-weight: 500; border-bottom: 1px solid var(--grid); }
+  td { border-top: 1px solid var(--grid); }
+  tr:first-child td { border-top: none; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+  .status { display: inline-flex; align-items: center; gap: 6px; }
+  .status .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+
+  .note { color: var(--muted); font-size: 12px; margin: 8px 2px; }
+  .error { color: var(--critical); margin: 12px 0; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Delivery ops</h1>
+    <div class="filters">
+      <input type="date" id="from" aria-label="From date">
+      <span class="sep">–</span>
+      <input type="date" id="to" aria-label="To date">
+      <button class="chip" data-days="1">Today</button>
+      <button class="chip" data-days="7">7 days</button>
+      <button class="chip" data-days="30">30 days</button>
+    </div>
+  </header>
+
+  <div id="error" class="error hidden"></div>
+
+  <section class="tiles">
+    <div class="tile"><div class="label">Net revenue</div><div class="value" id="t-revenue">–</div><div class="sub">completed orders only</div></div>
+    <div class="tile"><div class="label">Orders</div><div class="value" id="t-orders">–</div></div>
+    <div class="tile"><div class="label">Completed</div><div class="value" id="t-completed">–</div></div>
+    <div class="tile"><div class="label">Cancelled</div><div class="value" id="t-cancelled">–</div></div>
+  </section>
+
+  <h2>By platform</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>Platform</th><th class="num">Orders</th><th class="num">Completed</th><th class="num">Cancelled</th><th class="num">Revenue</th></tr></thead>
+      <tbody id="platforms"></tbody>
+    </table>
+  </div>
+
+  <h2>Orders</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>Date</th><th>Platform</th><th>Order</th><th>Status</th><th class="num">Net</th></tr></thead>
+      <tbody id="orders"></tbody>
+    </table>
+  </div>
+  <div id="cap-note" class="note hidden">Showing the first 100 orders in range.</div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// Status colors pair with a text label — color never carries meaning alone
+const STATUS = {
+  completed:   { color: 'var(--good)',     label: 'Completed' },
+  in_progress: { color: 'var(--warn)',     label: 'In progress' },
+  refunded:    { color: 'var(--serious)',  label: 'Refunded' },
+  cancelled:   { color: 'var(--critical)', label: 'Cancelled' },
+  other:       { color: 'var(--muted)',    label: 'Other' },
+};
+const statusHtml = s => {
+  const st = STATUS[s] ?? STATUS.other;
+  return `<span class="status"><span class="dot" style="background:${st.color}"></span>${st.label}</span>`;
+};
+
+// Amounts are stored in ISO 4217 minor units; Intl knows each currency's fraction digits
+const fracDigits = c => {
+  try { return new Intl.NumberFormat('en', { style: 'currency', currency: c }).resolvedOptions().maximumFractionDigits; }
+  catch { return 2; }
+};
+const money = (minor, currency, compact = false) =>
+  new Intl.NumberFormat(undefined, { style: 'currency', currency, ...(compact ? { notation: 'compact' } : {}) })
+    .format(minor / 10 ** fracDigits(currency));
+
+const localDate = d => new Intl.DateTimeFormat('en-CA').format(d); // YYYY-MM-DD, browser tz
+
+function setRange(days) {
+  const now = new Date();
+  $('#to').value = localDate(now);
+  $('#from').value = localDate(new Date(now.getTime() - (days - 1) * 86400000));
+}
+
+function markChip(days) {
+  document.querySelectorAll('.chip').forEach(c =>
+    c.setAttribute('aria-pressed', String(c.dataset.days === String(days))));
+}
+
+async function getJson(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
+  return res.json();
+}
+
+async function load() {
+  const from = $('#from').value, to = $('#to').value;
+  if (!from || !to) return;
+  $('#error').classList.add('hidden');
+  try {
+    const q = `from=${from}&to=${to}`;
+    const [summary, ordersRes] = await Promise.all([
+      getJson(`/summary?${q}`),
+      getJson(`/orders?${q}&limit=100`),
+    ]);
+
+    const rev = Object.entries(summary.totals.revenueByCurrency);
+    $('#t-revenue').textContent = rev.length
+      ? rev.map(([c, m]) => money(m, c, true)).join(' + ')
+      : '–';
+    $('#t-orders').textContent = summary.totals.orders;
+    $('#t-completed').textContent = summary.totals.completed;
+    $('#t-cancelled').textContent = summary.platforms.reduce((s, p) => s + p.cancelled, 0);
+
+    $('#platforms').innerHTML = summary.platforms.map(p => `
+      <tr>
+        <td>${esc(p.platform)}</td>
+        <td class="num">${p.orders}</td>
+        <td class="num">${p.completed}</td>
+        <td class="num">${p.cancelled}</td>
+        <td class="num">${money(p.revenueMinor, p.currency)}</td>
+      </tr>`).join('')
+      || '<tr><td colspan="5" class="note">No data in range.</td></tr>';
+
+    const orders = ordersRes.orders;
+    $('#orders').innerHTML = orders.map(o => `
+      <tr>
+        <td>${esc(o.businessDate)}</td>
+        <td>${esc(o.platform)}</td>
+        <td>${esc(o.platformOrderId)}</td>
+        <td>${statusHtml(o.status)}</td>
+        <td class="num">${money(o.netAmountMinor, o.currency)}</td>
+      </tr>`).join('')
+      || '<tr><td colspan="5" class="note">No orders in range.</td></tr>';
+    $('#cap-note').classList.toggle('hidden', orders.length < 100);
+  } catch (err) {
+    const el = $('#error');
+    el.textContent = `Failed to load: ${err.message}`;
+    el.classList.remove('hidden');
+  }
+}
+
+document.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => {
+  setRange(Number(c.dataset.days));
+  markChip(c.dataset.days);
+  load();
+}));
+for (const id of ['#from', '#to']) $(id).addEventListener('change', () => { markChip(null); load(); });
+
+setRange(7);
+markChip(7);
+load();
+</script>
+</body>
+</html>

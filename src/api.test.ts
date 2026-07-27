@@ -53,6 +53,13 @@ test('GET /health', async () => {
   assert.deepEqual(res.json(), { ok: true });
 });
 
+test('GET / serves the dashboard', async () => {
+  const res = await app.inject({ method: 'GET', url: '/' });
+  assert.equal(res.statusCode, 200);
+  assert.match(res.headers['content-type'] as string, /text\/html/);
+  assert.match(res.body, /Delivery ops/);
+});
+
 test('GET /summary aggregates cross-platform on business dates (merchant tz)', async () => {
   const res = await app.inject({ method: 'GET', url: '/summary?from=2026-07-14&to=2026-07-14' });
   assert.equal(res.statusCode, 200);
