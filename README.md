@@ -52,15 +52,16 @@ GET /fetch-runs?limit=20                          # did last night's fetch work?
 
 ## Run as a service (macOS)
 
-A LaunchAgent keeps the server (scheduler + dashboard) running across crashes and
-reboots — plist at `~/Library/LaunchAgents/com.dongday.delivery-platform.plist`,
-logs at `~/Library/Logs/delivery-platform.log`. The node path inside it is
-nvm-versioned; update it after a node upgrade.
+Optional: a LaunchAgent keeps the server (scheduler + dashboard) running across
+crashes and reboots, logging to `~/Library/Logs/delivery-platform.log`. The node
+path inside the plist is nvm-versioned; update it after a node upgrade.
 
 ```bash
+cp scripts/com.dongday.delivery-platform.plist ~/Library/LaunchAgents/                        # install
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dongday.delivery-platform.plist   # start
 launchctl kickstart -k gui/$(id -u)/com.dongday.delivery-platform                             # restart (e.g. after git pull)
-launchctl bootout gui/$(id -u)/com.dongday.delivery-platform                                  # stop/uninstall
+launchctl bootout gui/$(id -u)/com.dongday.delivery-platform                                  # stop
+rm ~/Library/LaunchAgents/com.dongday.delivery-platform.plist                                 # remove auto-start
 ```
 
 ## Language
