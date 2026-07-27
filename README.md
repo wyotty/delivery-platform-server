@@ -49,6 +49,19 @@ GET /orders?from=&to=&platform=&status=&limit=    # newest first; range optional
 GET /fetch-runs?limit=20                          # did last night's fetch work?
 ```
 
+## Run as a service (macOS)
+
+A LaunchAgent keeps the server (scheduler + dashboard) running across crashes and
+reboots — plist at `~/Library/LaunchAgents/com.dongday.delivery-platform.plist`,
+logs at `~/Library/Logs/delivery-platform.log`. The node path inside it is
+nvm-versioned; update it after a node upgrade.
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dongday.delivery-platform.plist   # start
+launchctl kickstart -k gui/$(id -u)/com.dongday.delivery-platform                             # restart (e.g. after git pull)
+launchctl bootout gui/$(id -u)/com.dongday.delivery-platform                                  # stop/uninstall
+```
+
 ## Language
 
 **TypeScript** — fable recommendation. Playwright is TypeScript-first, all platform adapters involve browser automation + JSON wrangling, and types can be shared with a future web dashboard.
