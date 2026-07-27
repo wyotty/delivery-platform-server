@@ -43,7 +43,7 @@ export async function withRetry<T>(
  */
 export async function runAllAccounts(
   sessionStore: SessionStore = new DbSessionStore(),
-  trailingDays = Number(process.env.FETCH_TRAILING_DAYS ?? 2),
+  trailingDays = Number(process.env.FETCH_TRAILING_DAYS || 2),
 ): Promise<void> {
   for (const account of listAccounts()) {
     if (getSessionState(account.id) === 'needs_human') {
@@ -67,7 +67,7 @@ export async function runAllAccounts(
 }
 
 export function startScheduler(): void {
-  const expr = process.env.SCHEDULE_CRON ?? '30 6 * * *'; // daily 06:30, server-local time
+  const expr = process.env.SCHEDULE_CRON || '30 6 * * *'; // daily 06:30, server-local time
   let running = false; // ponytail: global overlap guard; per-account locks if runs ever exceed a day
   cron.schedule(expr, async () => {
     if (running) {

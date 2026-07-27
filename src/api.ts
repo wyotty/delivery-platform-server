@@ -138,7 +138,7 @@ export async function buildApi(logger: boolean | { transport: { target: string }
   return app;
 }
 
-export async function startApi(port = Number(process.env.PORT ?? 3000)) {
+export async function startApi(port = Number(process.env.PORT || 3000)) {
   const app = await buildApi();
   await app.listen({ port, host: '0.0.0.0' });
   return app;

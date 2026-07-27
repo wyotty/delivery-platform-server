@@ -6,7 +6,8 @@ import { dirname } from 'node:path';
 import * as schema from './schema.js';
 import { UnifiedOrder, FetchRun, SessionStore } from '../core/types.js';
 
-const dbPath = process.env.DB_PATH ?? 'data/delivery.db';
+// || not ??: .env templates ship `DB_PATH=` — an empty string must mean "use the default"
+const dbPath = process.env.DB_PATH || 'data/delivery.db';
 mkdirSync(dirname(dbPath), { recursive: true });
 const sqlite = new Database(dbPath);
 sqlite.pragma('journal_mode = WAL');
