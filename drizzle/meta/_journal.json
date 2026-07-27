@@ -8,6 +8,13 @@
       "when": 1784030340714,
       "tag": "0000_easy_impossible_man",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1785165620709,
+      "tag": "0001_motionless_rafael_vega",
+      "breakpoints": true
     }
   ]
 }

@@ -1,12 +1,14 @@
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
-import { eq } from 'drizzle-orm';
+import { eq, and, gte, lte, desc, sql } from 'drizzle-orm';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import * as schema from './schema.js';
-import { UnifiedOrder, FetchRun, SessionStore } from '../core/types.js';
+import { UnifiedOrder, FetchRun, SessionStore, AuthState } from '../core/types.js';
 
-const dbPath = process.env.DB_PATH ?? 'data/delivery.db';
+// `||` not `??` — .env.example ships an empty `DB_PATH=`, and dotenv turns that
+// into '' which `??` would happily pass through to an anonymous temp database
+const dbPath = process.env.DB_PATH || 'data/delivery.db';
 mkdirSync(dirname(dbPath), { recursive: true });
 const sqlite = new Database(dbPath);
 sqlite.pragma('journal_mode = WAL');
@@ -27,6 +29,7 @@ export function upsertOrder(order: UnifiedOrder) {
       netAmountMinor: order.netAmountMinor,
       currency: order.currency,
       orderedAt: order.orderedAt,
+      reportDate: order.reportDate,
       platformTimezone: order.platformTimezone,
       updatedAt: order.updatedAt,
       rawJson: JSON.stringify(order.rawJson),
@@ -38,6 +41,9 @@ export function upsertOrder(order: UnifiedOrder) {
         platformStatus: order.platformStatus,
         netAmountMinor: order.netAmountMinor,
         grossAmountMinor: order.grossAmountMinor,
+        // Re-fetching a day can only ever reconfirm that day: a given order is
+        // returned under exactly one business day, so this is not a moving target.
+        reportDate: order.reportDate,
         updatedAt: order.updatedAt,
         rawJson: JSON.stringify(order.rawJson),
       },
@@ -115,4 +121,98 @@ export function getAccount(accountId: string) {
     .from(schema.platformAccounts)
     .where(eq(schema.platformAccounts.id, accountId))
     .get();
+}
+
+export function listAccounts() {
+  return db.select().from(schema.platformAccounts).all();
+}
+
+// ===== Session state (for needs_human alerting) =====
+
+export function setSessionState(accountId: string, state: AuthState) {
+  db.update(schema.platformSessions)
+    .set({ state, updatedAt: new Date().toISOString() })
+    .where(eq(schema.platformSessions.accountId, accountId))
+    .run();
+}
+
+export function getSessionState(accountId: string): AuthState | null {
+  const row = db.select({ state: schema.platformSessions.state })
+    .from(schema.platformSessions)
+    .where(eq(schema.platformSessions.accountId, accountId))
+    .get();
+  return row?.state ?? null;
+}
+
+// ===== Reporting queries =====
+
+export interface SummaryRow {
+  platform: string;
+  reportDate: string;
+  currency: string;
+  orderCount: number;
+  completedCount: number;
+  revenueMinor: number;
+}
+
+/**
+ * Per-platform, per-day totals over the platform's own business day.
+ * Revenue counts completed orders only — cancelled Grab statements can still
+ * carry a non-zero earnings figure, and including them overstates takings.
+ */
+export function getSummary(range: { from: string; to: string; merchantId?: string }): SummaryRow[] {
+  const conditions = [
+    gte(schema.orders.reportDate, range.from),
+    lte(schema.orders.reportDate, range.to),
+  ];
+  if (range.merchantId) conditions.push(eq(schema.orders.merchantId, range.merchantId));
+
+  return db.select({
+    platform: schema.orders.platform,
+    reportDate: schema.orders.reportDate,
+    currency: schema.orders.currency,
+    orderCount: sql<number>`count(*)`,
+    completedCount: sql<number>`sum(case when ${schema.orders.status} = 'completed' then 1 else 0 end)`,
+    revenueMinor: sql<number>`coalesce(sum(case when ${schema.orders.status} = 'completed' then ${schema.orders.netAmountMinor} else 0 end), 0)`,
+  })
+    .from(schema.orders)
+    .where(and(...conditions))
+    .groupBy(schema.orders.platform, schema.orders.reportDate, schema.orders.currency)
+    .orderBy(schema.orders.reportDate, schema.orders.platform)
+    .all();
+}
+
+export function listOrders(range: { from: string; to: string; merchantId?: string; platform?: string; limit?: number }) {
+  const conditions = [
+    gte(schema.orders.reportDate, range.from),
+    lte(schema.orders.reportDate, range.to),
+  ];
+  if (range.merchantId) conditions.push(eq(schema.orders.merchantId, range.merchantId));
+  if (range.platform) conditions.push(eq(schema.orders.platform, range.platform));
+
+  return db.select({
+    platform: schema.orders.platform,
+    platformOrderId: schema.orders.platformOrderId,
+    merchantId: schema.orders.merchantId,
+    status: schema.orders.status,
+    platformStatus: schema.orders.platformStatus,
+    netAmountMinor: schema.orders.netAmountMinor,
+    grossAmountMinor: schema.orders.grossAmountMinor,
+    currency: schema.orders.currency,
+    orderedAt: schema.orders.orderedAt,
+    reportDate: schema.orders.reportDate,
+  })
+    .from(schema.orders)
+    .where(and(...conditions))
+    .orderBy(desc(schema.orders.orderedAt))
+    .limit(range.limit ?? 500)
+    .all();
+}
+
+export function listFetchRuns(limit = 50) {
+  return db.select()
+    .from(schema.fetchRuns)
+    .orderBy(desc(schema.fetchRuns.id))
+    .limit(limit)
+    .all();
 }

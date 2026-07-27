@@ -36,6 +36,15 @@ export interface UnifiedOrder {
   currency: string;
   /** ISO 8601 UTC timestamp of when the order was placed */
   orderedAt: string;
+  /**
+   * The platform's own business day this order was reported under ('YYYY-MM-DD',
+   * merchant-local). NOT derivable from orderedAt: Grab buckets by a server-side
+   * business day that matches neither createdAt nor updatedAt — an order placed
+   * 23:33 and settled 00:00:38 the next day still lands in the earlier day's
+   * report. Aggregate on this to reconcile with the platform's own dashboard;
+   * aggregate on orderedAt to answer "when did customers actually order".
+   */
+  reportDate: string;
   /** Original timezone of the merchant (IANA name) */
   platformTimezone: string;
   /** ISO 8601 UTC timestamp when the platform last reported this order */

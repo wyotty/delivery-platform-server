@@ -34,6 +34,7 @@ const order: UnifiedOrder = {
   netAmountMinor: 312000,
   currency: 'VND',
   orderedAt: '2026-07-14T06:22:29Z',
+  reportDate: '2026-07-14',
   platformTimezone: 'Asia/Ho_Chi_Minh',
   updatedAt: '2026-07-14T06:40:13Z',
   rawJson: { ID: 'ORDER-1' },

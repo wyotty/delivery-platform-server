@@ -6,6 +6,7 @@ export function normalizeOrder(
   accountId: string,
   merchantId: string,
   platformTimezone: string,
+  reportDate: string,
 ): UnifiedOrder {
   // Status mapping: cancelled is detected by cancelRole/cancelledAt, not by deliveryStatus
   const isCancelled = !!(statement.cancelRole || statement.cancelledAt);
@@ -30,6 +31,7 @@ export function normalizeOrder(
     netAmountMinor: netMinor,
     currency,
     orderedAt: statement.createdAt,
+    reportDate,
     platformTimezone,
     rawJson: statement,
     updatedAt: statement.updatedAt,

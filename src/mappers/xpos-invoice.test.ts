@@ -23,6 +23,7 @@ function makeOrder(overrides: Partial<UnifiedOrder> = {}): UnifiedOrder {
     netAmountMinor: 312000,
     currency: 'VND',
     orderedAt: '2026-07-14T06:22:29Z',
+    reportDate: '2026-07-14',
     platformTimezone: 'Asia/Ho_Chi_Minh',
     updatedAt: '2026-07-14T06:40:13.122Z',
     rawJson: { some: 'payload' },
@@ -162,7 +163,7 @@ test('maps orderedAt -> created_at and updatedAt -> updated_at as Dates', () => 
 test('end-to-end: normalizeOrder -> mapUnifiedOrderToInvoice for every real Grab sample', () => {
   assert.ok(samples.grab_orders.length > 0);
   for (const grab of samples.grab_orders as GrabStatement[]) {
-    const unified = normalizeOrder(grab, 'grab-dong-day', 'dong-day', 'Asia/Ho_Chi_Minh');
+    const unified = normalizeOrder(grab, 'grab-dong-day', 'dong-day', 'Asia/Ho_Chi_Minh', '2026-07-14');
     const invoice = mapUnifiedOrderToInvoice(unified);
 
     assert.equal(invoice.type, InvoiceType.Delivery);

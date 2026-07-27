@@ -1,106 +1,40 @@
 #!/usr/bin/env tsx
-// Composition root — registers connectors, wires up the app
+// CLI composition root — registers connectors, then delegates to the same fetch
+// service the scheduler uses, so both paths behave identically.
 import 'dotenv/config';
-import { registerConnector, getConnector } from './core/registry.js';
-import { GrabConnector } from './platforms/grab/index.js';
-import { upsertOrders, logFetchRun, DbSessionStore, getAccount } from './db/repo.js';
-import { PlatformAccount, DateRange } from './core/types.js';
 import pino from 'pino';
+import { registerConnector } from './core/registry.js';
+import { GrabConnector } from './platforms/grab/index.js';
+import { DbSessionStore } from './db/repo.js';
+import { buildAccount, fetchAndStore } from './core/fetch-service.js';
+import { DateRange } from './core/types.js';
 
-// Register connectors at startup
 registerConnector(new GrabConnector());
 
 const logger = pino({ transport: { target: 'pino-pretty' } });
 const sessionStore = new DbSessionStore();
 
+function usage(): never {
+  console.error('Usage: pnpm run fetch <platform> <account_id> [from] [to]');
+  console.error('Example: pnpm run fetch grab grab-dong-day 2026-07-26');
+  process.exit(1);
+}
+
 async function main() {
-  const args = process.argv.slice(2);
-  const command = args[0];
+  const [command, platform, accountId, from, to] = process.argv.slice(2);
+  if (command !== 'fetch' || !platform || !accountId) usage();
 
-  if (command === 'fetch') {
-    const platform = args[1];
-    const accountId = args[2];
-    const from = args[3] ?? new Date().toISOString().split('T')[0];
-    const to = args[4] ?? from;
+  const start = from ?? new Date().toISOString().slice(0, 10);
+  const range: DateRange = { from: start, to: to ?? start };
 
-    if (!platform || !accountId) {
-      console.error('Usage: pnpm fetch <platform> <account_id> [from] [to]');
-      console.error('Example: pnpm fetch grab grab-dong-day 2026-07-13');
-      process.exit(1);
-    }
+  const account = buildAccount(accountId, platform);
+  const result = await fetchAndStore(account, range, sessionStore, logger);
 
-    // Load account from DB (not env vars — single source of truth)
-    const accountRow = getAccount(accountId);
-    if (!accountRow) {
-      console.error(`Account not found: ${accountId}. Run seed first.`);
-      process.exit(1);
-    }
-
-    if (accountRow.platform !== platform) {
-      console.error(`Account ${accountId} belongs to platform '${accountRow.platform}', not '${platform}'.`);
-      process.exit(1);
-    }
-
-    const range: DateRange = { from, to };
-    const startedAt = new Date().toISOString();
-
-    logger.info({ platform, accountId, from, to }, 'Fetching orders');
-
-    try {
-      const connector = getConnector(platform);
-      // ponytail: env prefix from platform name; key off credentialKey when one platform needs multiple credential sets
-      const envPrefix = accountRow.platform.toUpperCase();
-      const account: PlatformAccount = {
-        id: accountRow.id,
-        platform: accountRow.platform,
-        merchantId: accountRow.merchantId,
-        merchantName: accountRow.label,
-        credentials: {
-          username: process.env[`${envPrefix}_USERNAME`] || '',
-          password: process.env[`${envPrefix}_PASSWORD`] || '',
-        },
-        timezone: accountRow.timezone,
-        config: JSON.parse(accountRow.config),
-      };
-
-      const orders = await connector.fetchOrders(account, range, sessionStore);
-      upsertOrders(orders);
-      logFetchRun({
-        platform: account.platform,
-        accountId: account.id,
-        dateFrom: from,
-        dateTo: to,
-        status: 'success',
-        orderCount: orders.length,
-        startedAt,
-        completedAt: new Date().toISOString(),
-      });
-
-      // Revenue = completed orders only (cancelled Grab statements can still carry earnings)
-      const completedOrders = orders.filter(o => o.status === 'completed');
-      const totalRevenue = completedOrders.reduce((s, o) => s + o.netAmountMinor, 0);
-      logger.info({ totalOrders: orders.length, completed: completedOrders.length, revenueMinor: totalRevenue }, 'Done');
-      console.log(JSON.stringify({ total_orders: orders.length, completed: completedOrders.length, revenue_minor: totalRevenue }, null, 2));
-    } catch (err: any) {
-      logFetchRun({
-        platform,
-        accountId,
-        dateFrom: from,
-        dateTo: to,
-        status: 'failure',
-        orderCount: 0,
-        errorMessage: err.message,
-        startedAt,
-        completedAt: new Date().toISOString(),
-      });
-      logger.error({ err }, 'Fetch failed');
-      process.exit(1);
-    }
-  } else {
-    console.error('Usage: pnpm fetch <platform> <account_id> [from] [to]');
-    console.error('Example: pnpm fetch grab grab-dong-day 2026-07-14');
-    process.exit(1);
-  }
+  console.log(JSON.stringify({
+    total_orders: result.totalOrders,
+    completed: result.completed,
+    revenue_minor: result.revenueMinor,
+  }, null, 2));
 }
 
 main().catch(err => {
