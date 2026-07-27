@@ -151,6 +151,10 @@ export function listOrders(q: OrderQuery) {
   return (q.limit ? base.limit(q.limit) : base).all();
 }
 
+export function getOrder(id: number) {
+  return db.select().from(schema.orders).where(eq(schema.orders.id, id)).get();
+}
+
 export function listFetchRuns(limit = 20) {
   return db.select()
     .from(schema.fetchRuns)

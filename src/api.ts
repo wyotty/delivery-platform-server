@@ -9,7 +9,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dateInTz } from './core/dates.js';
-import { listFetchRuns, listOrders, OrderQuery } from './db/repo.js';
+import { getOrder, listFetchRuns, listOrders, OrderQuery } from './db/repo.js';
 
 const dashboardPath = join(dirname(fileURLToPath(import.meta.url)), 'dashboard.html');
 
@@ -123,6 +123,20 @@ export async function buildApi(logger: boolean | { transport: { target: string }
       return { orders: rows.slice(0, limit) };
     }
     return { orders: listOrders({ platform, accountId, status, limit }) };
+  });
+
+  app.get<{ Params: { id: number } }>('/orders/:id', {
+    schema: {
+      params: {
+        type: 'object',
+        required: ['id'],
+        properties: { id: { type: 'integer' } },
+      },
+    },
+  }, async (req, reply) => {
+    const row = getOrder(req.params.id);
+    if (!row) return reply.code(404).send({ error: 'Order not found' });
+    return { ...row, rawJson: JSON.parse(row.rawJson) };
   });
 
   // "Did last night's fetch work?"

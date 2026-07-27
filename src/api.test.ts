@@ -99,6 +99,21 @@ test('GET /orders without range returns newest first with limit', async () => {
   assert.equal(orders[0].platformOrderId, 'C');
 });
 
+test('GET /orders/:id returns the full order with parsed rawJson; 404 when missing', async () => {
+  const list = await app.inject({ method: 'GET', url: '/orders?limit=1' });
+  const id = list.json().orders[0].id;
+
+  const res = await app.inject({ method: 'GET', url: `/orders/${id}` });
+  assert.equal(res.statusCode, 200);
+  const o = res.json();
+  assert.equal(o.id, id);
+  assert.deepEqual(o.rawJson, {}); // parsed object, not a JSON string
+  assert.ok(o.platformOrderId);
+
+  assert.equal((await app.inject({ method: 'GET', url: '/orders/999999' })).statusCode, 404);
+  assert.equal((await app.inject({ method: 'GET', url: '/orders/abc' })).statusCode, 400);
+});
+
 test('GET /orders rejects from without to', async () => {
   const res = await app.inject({ method: 'GET', url: '/orders?from=2026-07-14' });
   assert.equal(res.statusCode, 400);

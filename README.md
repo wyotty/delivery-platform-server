@@ -46,6 +46,7 @@ GET /                                             # dashboard (KPI tiles + order
 GET /health
 GET /summary?from=2026-07-01&to=2026-07-14        # cross-platform totals (revenue = completed only)
 GET /orders?from=&to=&platform=&status=&limit=    # newest first; range optional
+GET /orders/:id                                   # full order incl. raw platform payload
 GET /fetch-runs?limit=20                          # did last night's fetch work?
 ```
 

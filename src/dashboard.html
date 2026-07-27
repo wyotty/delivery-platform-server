@@ -71,6 +71,29 @@
   .note { color: var(--muted); font-size: 12px; margin: 8px 2px; }
   .error { color: var(--critical); margin: 12px 0; }
   .hidden { display: none; }
+
+  #orders tr[data-id] { cursor: pointer; }
+  #orders tr[data-id]:hover td { background: var(--page); }
+  #orders tr[data-id]:focus-visible { outline: 2px solid var(--muted); outline-offset: -2px; }
+
+  dialog {
+    background: var(--surface); color: var(--ink);
+    border: 1px solid var(--border); border-radius: 12px; padding: 0;
+    width: min(680px, 92vw);
+  }
+  dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+  .dlg-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--grid); }
+  .dlg-title { font-weight: 600; }
+  .dlg-close { font: inherit; color: var(--ink-2); background: transparent; border: 1px solid var(--border); border-radius: 8px; padding: 3px 10px; cursor: pointer; }
+  .dlg-close:hover { background: var(--page); }
+  .dlg-body { padding: 14px 18px 18px; }
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 6px 12px; font-size: 13.5px; margin: 0; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; overflow-wrap: anywhere; }
+  pre.raw {
+    background: var(--page); border: 1px solid var(--grid); border-radius: 8px;
+    padding: 10px 12px; overflow: auto; max-height: 320px; font-size: 12px; margin: 14px 0 0;
+  }
 </style>
 </head>
 <body>
@@ -113,6 +136,14 @@
   </div>
   <div id="cap-note" class="note hidden">Showing the first 100 orders in range.</div>
 </div>
+
+<dialog id="order-dialog">
+  <div class="dlg-head">
+    <span class="dlg-title" id="dlg-title"></span>
+    <button class="dlg-close" id="dlg-close">Close</button>
+  </div>
+  <div class="dlg-body" id="dlg-body"></div>
+</dialog>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -190,7 +221,7 @@ async function load() {
 
     const orders = ordersRes.orders;
     $('#orders').innerHTML = orders.map(o => `
-      <tr>
+      <tr data-id="${o.id}" tabindex="0">
         <td>${esc(o.businessDate)}</td>
         <td>${esc(o.platform)}</td>
         <td>${esc(o.platformOrderId)}</td>
@@ -205,6 +236,50 @@ async function load() {
     el.classList.remove('hidden');
   }
 }
+
+const localDateTime = (iso, tz) =>
+  new Intl.DateTimeFormat(undefined, { timeZone: tz, dateStyle: 'medium', timeStyle: 'short' }).format(new Date(iso));
+
+async function openOrder(id) {
+  try {
+    const o = await getJson(`/orders/${id}`);
+    const kv = (k, v) => `<dt>${k}</dt><dd>${v}</dd>`;
+    $('#dlg-title').textContent = o.platformOrderId;
+    $('#dlg-body').innerHTML = `
+      <dl class="kv">
+        ${kv('Status', statusHtml(o.status))}
+        ${kv('Platform', esc(o.platform))}
+        ${kv('Platform status', esc(o.platformStatus))}
+        ${kv('Ordered', esc(localDateTime(o.orderedAt, o.platformTimezone)) + ' <span style="color:var(--muted)">' + esc(o.platformTimezone) + '</span>')}
+        ${kv('Last update', esc(localDateTime(o.updatedAt, o.platformTimezone)))}
+        ${kv('Net', money(o.netAmountMinor, o.currency))}
+        ${kv('Gross', o.grossAmountMinor == null ? '–' : money(o.grossAmountMinor, o.currency))}
+        ${kv('Account', esc(o.accountId))}
+        ${kv('Merchant', esc(o.merchantId))}
+      </dl>
+      <pre class="raw">${esc(JSON.stringify(o.rawJson, null, 2))}</pre>`;
+    $('#order-dialog').showModal();
+  } catch (err) {
+    const el = $('#error');
+    el.textContent = `Failed to load order: ${err.message}`;
+    el.classList.remove('hidden');
+  }
+}
+
+$('#orders').addEventListener('click', e => {
+  const tr = e.target.closest('tr[data-id]');
+  if (tr) openOrder(tr.dataset.id);
+});
+$('#orders').addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    const tr = e.target.closest('tr[data-id]');
+    if (tr) openOrder(tr.dataset.id);
+  }
+});
+$('#dlg-close').addEventListener('click', () => $('#order-dialog').close());
+$('#order-dialog').addEventListener('click', e => {
+  if (e.target === e.currentTarget) e.currentTarget.close(); // backdrop click; Esc is native
+});
 
 document.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => {
   setRange(Number(c.dataset.days));
