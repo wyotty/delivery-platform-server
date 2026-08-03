@@ -201,13 +201,14 @@ async function load() {
       getJson(`/orders?${q}&limit=100`),
     ]);
 
-    const rev = Object.entries(summary.totals.revenueByCurrency);
-    $('#t-revenue').textContent = rev.length
-      ? rev.map(([c, m]) => money(m, c, true)).join(' + ')
+    // totals is keyed by currency — revenue is never summed across currencies.
+    const totals = Object.entries(summary.totals);
+    $('#t-revenue').textContent = totals.length
+      ? totals.map(([c, t]) => money(t.revenueMinor, c, true)).join(' + ')
       : '–';
-    $('#t-orders').textContent = summary.totals.orders;
-    $('#t-completed').textContent = summary.totals.completed;
-    $('#t-cancelled').textContent = summary.platforms.reduce((s, p) => s + p.cancelled, 0);
+    $('#t-orders').textContent = totals.reduce((s, [, t]) => s + t.orderCount, 0);
+    $('#t-completed').textContent = totals.reduce((s, [, t]) => s + t.completedCount, 0);
+    $('#t-cancelled').textContent = totals.reduce((s, [, t]) => s + t.cancelledCount, 0);
 
     $('#platforms').innerHTML = summary.platforms.map(p => `
       <tr>
@@ -222,7 +223,7 @@ async function load() {
     const orders = ordersRes.orders;
     $('#orders').innerHTML = orders.map(o => `
       <tr data-id="${o.id}" tabindex="0">
-        <td>${esc(o.businessDate)}</td>
+        <td>${esc(o.reportDate)}</td>
         <td>${esc(o.platform)}</td>
         <td>${esc(o.platformOrderId)}</td>
         <td>${statusHtml(o.status)}</td>

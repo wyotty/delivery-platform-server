@@ -10,7 +10,7 @@ const orders: GrabStatement[] = fixtures.grab_orders;
 const completed = orders.find(o => o.deliveryStatus === 'COMPLETED')!;
 const executing = orders.find(o => o.deliveryStatus === 'ORDER_EXECUTING')!;
 
-const norm = (s: GrabStatement) => normalizeOrder(s, 'acct-1', 'merch-1', 'Asia/Ho_Chi_Minh');
+const norm = (s: GrabStatement) => normalizeOrder(s, 'acct-1', 'merch-1', 'Asia/Ho_Chi_Minh', '2026-07-14');
 
 test('COMPLETED maps to completed', () => {
   assert.equal(norm(completed).status, 'completed');

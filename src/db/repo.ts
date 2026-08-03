@@ -1,12 +1,13 @@
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
-import { and, desc, eq, gte, lte } from 'drizzle-orm';
+import { and, desc, eq, gte, lte, sql } from 'drizzle-orm';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import * as schema from './schema.js';
-import { UnifiedOrder, FetchRun, SessionStore } from '../core/types.js';
+import { UnifiedOrder, FetchRun, SessionStore, AuthState } from '../core/types.js';
 
-// || not ??: .env templates ship `DB_PATH=` — an empty string must mean "use the default"
+// `||` not `??` — .env.example ships an empty `DB_PATH=`, and dotenv turns that
+// into '' which `??` would happily pass through to an anonymous temp database
 const dbPath = process.env.DB_PATH || 'data/delivery.db';
 mkdirSync(dirname(dbPath), { recursive: true });
 const sqlite = new Database(dbPath);
@@ -28,6 +29,7 @@ export function upsertOrder(order: UnifiedOrder) {
       netAmountMinor: order.netAmountMinor,
       currency: order.currency,
       orderedAt: order.orderedAt,
+      reportDate: order.reportDate,
       platformTimezone: order.platformTimezone,
       updatedAt: order.updatedAt,
       rawJson: JSON.stringify(order.rawJson),
@@ -39,6 +41,9 @@ export function upsertOrder(order: UnifiedOrder) {
         platformStatus: order.platformStatus,
         netAmountMinor: order.netAmountMinor,
         grossAmountMinor: order.grossAmountMinor,
+        // Re-fetching a day can only ever reconfirm that day: a given order is
+        // returned under exactly one business day, so this is not a moving target.
+        reportDate: order.reportDate,
         updatedAt: order.updatedAt,
         rawJson: JSON.stringify(order.rawJson),
       },
@@ -109,84 +114,39 @@ export class DbSessionStore implements SessionStore {
   }
 }
 
-export interface OrderQuery {
-  /** UTC instant bounds on orderedAt (ISO strings — lexicographic compare works for Zulu format) */
-  fromUtc?: string;
-  toUtc?: string;
-  platform?: string;
-  accountId?: string;
-  status?: UnifiedOrder['status'];
-  limit?: number;
+// ===== Session state (needs_human gating + alerting) =====
+
+/**
+ * Upsert, not update: auth can break before any session was ever stored (first
+ * login fails), and an UPDATE against the missing row would silently record
+ * nothing — leaving the scheduler to retry a broken login every night forever.
+ */
+export function setSessionState(accountId: string, state: AuthState) {
+  db.insert(schema.platformSessions)
+    .values({
+      accountId,
+      sessionJson: '{}', // no valid session exists; fetchedAt 0 = treated as expired everywhere
+      state,
+      fetchedAt: 0,
+    })
+    .onConflictDoUpdate({
+      target: schema.platformSessions.accountId,
+      set: { state, updatedAt: new Date().toISOString() },
+    })
+    .run();
 }
 
-/** List orders newest-first. rawJson excluded — it's a blob, fetch by id if ever needed. */
-export function listOrders(q: OrderQuery) {
-  const conds = [
-    q.fromUtc ? gte(schema.orders.orderedAt, q.fromUtc) : undefined,
-    q.toUtc ? lte(schema.orders.orderedAt, q.toUtc) : undefined,
-    q.platform ? eq(schema.orders.platform, q.platform) : undefined,
-    q.accountId ? eq(schema.orders.accountId, q.accountId) : undefined,
-    q.status ? eq(schema.orders.status, q.status) : undefined,
-  ].filter(c => c !== undefined);
-
-  const base = db.select({
-    id: schema.orders.id,
-    platform: schema.orders.platform,
-    platformOrderId: schema.orders.platformOrderId,
-    accountId: schema.orders.accountId,
-    merchantId: schema.orders.merchantId,
-    status: schema.orders.status,
-    platformStatus: schema.orders.platformStatus,
-    grossAmountMinor: schema.orders.grossAmountMinor,
-    netAmountMinor: schema.orders.netAmountMinor,
-    currency: schema.orders.currency,
-    orderedAt: schema.orders.orderedAt,
-    platformTimezone: schema.orders.platformTimezone,
-    updatedAt: schema.orders.updatedAt,
-  })
-    .from(schema.orders)
-    .where(conds.length ? and(...conds) : undefined)
-    .orderBy(desc(schema.orders.orderedAt));
-
-  return (q.limit ? base.limit(q.limit) : base).all();
+/** Auth is broken beyond auto-recovery — scheduler skips this account until a human re-auths (CLI import-session). */
+export function markSessionNeedsHuman(accountId: string) {
+  setSessionState(accountId, 'needs_human');
 }
 
-export function getOrder(id: number) {
-  return db.select().from(schema.orders).where(eq(schema.orders.id, id)).get();
-}
-
-export function listFetchRuns(limit = 20) {
-  return db.select()
-    .from(schema.fetchRuns)
-    .orderBy(desc(schema.fetchRuns.startedAt))
-    .limit(limit)
-    .all();
-}
-
-// ===== Session state (needs_human gating for the scheduler) =====
-
-export function getSessionState(accountId: string): 'valid' | 'expired' | 'needs_human' | null {
+export function getSessionState(accountId: string): AuthState | null {
   const row = db.select({ state: schema.platformSessions.state })
     .from(schema.platformSessions)
     .where(eq(schema.platformSessions.accountId, accountId))
     .get();
   return row?.state ?? null;
-}
-
-/** Auth is broken beyond auto-recovery — scheduler skips this account until a human re-auths (CLI import-session). */
-export function markSessionNeedsHuman(accountId: string) {
-  db.insert(schema.platformSessions)
-    .values({
-      accountId,
-      sessionJson: '{}', // no valid session exists; fetchedAt 0 = treated as expired everywhere
-      state: 'needs_human',
-      fetchedAt: 0,
-    })
-    .onConflictDoUpdate({
-      target: schema.platformSessions.accountId,
-      set: { state: 'needs_human' },
-    })
-    .run();
 }
 
 // ===== Platform accounts =====
@@ -202,4 +162,85 @@ export function getAccount(accountId: string) {
 
 export function listAccounts(): PlatformAccountRow[] {
   return db.select().from(schema.platformAccounts).all();
+}
+
+// ===== Reporting queries =====
+
+export interface SummaryRow {
+  platform: string;
+  reportDate: string;
+  currency: string;
+  orderCount: number;
+  completedCount: number;
+  cancelledCount: number;
+  revenueMinor: number;
+}
+
+/**
+ * Per-platform, per-day totals over the platform's own business day.
+ * Revenue counts completed orders only — cancelled Grab statements can still
+ * carry a non-zero earnings figure, and including them overstates takings.
+ */
+export function getSummary(range: { from: string; to: string; merchantId?: string }): SummaryRow[] {
+  const conditions = [
+    gte(schema.orders.reportDate, range.from),
+    lte(schema.orders.reportDate, range.to),
+  ];
+  if (range.merchantId) conditions.push(eq(schema.orders.merchantId, range.merchantId));
+
+  return db.select({
+    platform: schema.orders.platform,
+    reportDate: schema.orders.reportDate,
+    currency: schema.orders.currency,
+    orderCount: sql<number>`count(*)`,
+    completedCount: sql<number>`sum(case when ${schema.orders.status} = 'completed' then 1 else 0 end)`,
+    cancelledCount: sql<number>`sum(case when ${schema.orders.status} = 'cancelled' then 1 else 0 end)`,
+    revenueMinor: sql<number>`coalesce(sum(case when ${schema.orders.status} = 'completed' then ${schema.orders.netAmountMinor} else 0 end), 0)`,
+  })
+    .from(schema.orders)
+    .where(and(...conditions))
+    .groupBy(schema.orders.platform, schema.orders.reportDate, schema.orders.currency)
+    .orderBy(schema.orders.reportDate, schema.orders.platform)
+    .all();
+}
+
+/** List orders newest-first. rawJson excluded — it's a blob, fetch it via getOrder. */
+export function listOrders(range: { from: string; to: string; merchantId?: string; platform?: string; limit?: number }) {
+  const conditions = [
+    gte(schema.orders.reportDate, range.from),
+    lte(schema.orders.reportDate, range.to),
+  ];
+  if (range.merchantId) conditions.push(eq(schema.orders.merchantId, range.merchantId));
+  if (range.platform) conditions.push(eq(schema.orders.platform, range.platform));
+
+  return db.select({
+    id: schema.orders.id,
+    platform: schema.orders.platform,
+    platformOrderId: schema.orders.platformOrderId,
+    merchantId: schema.orders.merchantId,
+    status: schema.orders.status,
+    platformStatus: schema.orders.platformStatus,
+    netAmountMinor: schema.orders.netAmountMinor,
+    grossAmountMinor: schema.orders.grossAmountMinor,
+    currency: schema.orders.currency,
+    orderedAt: schema.orders.orderedAt,
+    reportDate: schema.orders.reportDate,
+  })
+    .from(schema.orders)
+    .where(and(...conditions))
+    .orderBy(desc(schema.orders.orderedAt))
+    .limit(range.limit ?? 500)
+    .all();
+}
+
+export function getOrder(id: number) {
+  return db.select().from(schema.orders).where(eq(schema.orders.id, id)).get();
+}
+
+export function listFetchRuns(limit = 50) {
+  return db.select()
+    .from(schema.fetchRuns)
+    .orderBy(desc(schema.fetchRuns.id))
+    .limit(limit)
+    .all();
 }

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AuthError } from './core/types.js';
-import { trailingRange, withRetry } from './scheduler.js';
+import { AuthError } from '../core/types.js';
+import { trailingRange, withRetry } from './index.js';
 
 // 2026-07-25 18:00 UTC = 2026-07-26 01:00 in Asia/Ho_Chi_Minh (UTC+7)
 const now = new Date('2026-07-25T18:00:00Z');

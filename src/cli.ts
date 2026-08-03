@@ -1,77 +1,53 @@
 #!/usr/bin/env tsx
-// Composition root — registers connectors, wires up the app
+// CLI composition root — registers connectors, then delegates to the same fetch
+// service the scheduler uses, so both paths behave identically.
 import 'dotenv/config';
 import { readFileSync } from 'node:fs';
+import pino from 'pino';
 import { registerConnector } from './core/registry.js';
 import { GrabConnector } from './platforms/grab/index.js';
-import { DbSessionStore, getAccount } from './db/repo.js';
-import { runFetchJob } from './fetch-job.js';
+import { DbSessionStore } from './db/repo.js';
+import { buildAccount, fetchAndStore } from './core/fetch-service.js';
 import { DateRange } from './core/types.js';
-import pino from 'pino';
 
-// Register connectors at startup
 registerConnector(new GrabConnector());
 
 const logger = pino({ transport: { target: 'pino-pretty' } });
 const sessionStore = new DbSessionStore();
 
 function usage(): never {
-  console.error('Usage: pnpm fetch <platform> <account_id> [from] [to]');
+  // `pnpm run fetch`, not `pnpm fetch` — pnpm has its own built-in `fetch`
+  // command that would shadow the script and silently do nothing.
+  console.error('Usage: pnpm run fetch <platform> <account_id> [from] [to]');
   console.error('       pnpm cli import-session <account_id> <session.json>');
-  console.error('Example: pnpm fetch grab grab-dong-day 2026-07-13');
+  console.error('Example: pnpm run fetch grab grab-dong-day 2026-07-26');
   process.exit(1);
 }
 
 async function main() {
-  const args = process.argv.slice(2);
-  const command = args[0];
+  const [command, ...args] = process.argv.slice(2);
 
   if (command === 'fetch') {
-    const platform = args[1];
-    const accountId = args[2];
-    const from = args[3] ?? new Date().toISOString().split('T')[0];
-    const to = args[4] ?? from;
-
+    const [platform, accountId, from, to] = args;
     if (!platform || !accountId) usage();
 
-    // Load account from DB (not env vars — single source of truth)
-    const accountRow = getAccount(accountId);
-    if (!accountRow) {
-      console.error(`Account not found: ${accountId}. Run seed first.`);
-      process.exit(1);
-    }
+    const start = from ?? new Date().toISOString().slice(0, 10);
+    const range: DateRange = { from: start, to: to ?? start };
 
-    if (accountRow.platform !== platform) {
-      console.error(`Account ${accountId} belongs to platform '${accountRow.platform}', not '${platform}'.`);
-      process.exit(1);
-    }
+    const account = buildAccount(accountId, platform);
+    const result = await fetchAndStore(account, range, sessionStore, logger);
 
-    const range: DateRange = { from, to };
-    logger.info({ platform, accountId, from, to }, 'Fetching orders');
-
-    try {
-      const orders = await runFetchJob(accountRow, range, sessionStore);
-
-      // Revenue = completed orders only (cancelled Grab statements can still carry earnings)
-      const completedOrders = orders.filter(o => o.status === 'completed');
-      const totalRevenue = completedOrders.reduce((s, o) => s + o.netAmountMinor, 0);
-      logger.info({ totalOrders: orders.length, completed: completedOrders.length, revenueMinor: totalRevenue }, 'Done');
-      console.log(JSON.stringify({ total_orders: orders.length, completed: completedOrders.length, revenue_minor: totalRevenue }, null, 2));
-    } catch (err) {
-      logger.error({ err }, 'Fetch failed');
-      process.exit(1);
-    }
+    console.log(JSON.stringify({
+      total_orders: result.totalOrders,
+      completed: result.completed,
+      revenue_minor: result.revenueMinor,
+    }, null, 2));
   } else if (command === 'import-session') {
     // Recovery path for needs_human: paste a session captured manually (browser devtools)
-    const accountId = args[1];
-    const file = args[2];
+    const [accountId, file] = args;
     if (!accountId || !file) usage();
 
-    const accountRow = getAccount(accountId);
-    if (!accountRow) {
-      console.error(`Account not found: ${accountId}. Run seed first.`);
-      process.exit(1);
-    }
+    buildAccount(accountId); // fails loudly if the account isn't seeded
 
     const session = JSON.parse(readFileSync(file, 'utf8'));
     // Manually exported sessions rarely include our bookkeeping timestamp — stamp it now

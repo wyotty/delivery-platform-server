@@ -11,22 +11,29 @@ src/
 │   └── grab/        # Playwright auth + API client + normalizer
 ├── mappers/         # UnifiedOrder → @posx/core Invoice (docs/xpos-invoice-mapping.md)
 ├── db/              # Drizzle schema, repo layer
-├── notify/          # Telegram (grammY), email, etc.
-├── api.ts           # Fastify REST API
-├── fetch-job.ts     # Shared fetch flow (CLI + scheduler)
-├── scheduler.ts     # node-cron daily fetches
-├── index.ts         # Server entry (scheduler daemon)
-└── cli.ts           # CLI entry point
+├── scheduler/       # node-cron nightly fetch (trailing window + retry)
+├── api/             # Fastify REST API + dashboard route
+├── notify/          # Telegram (grammY) alerting
+├── config/          # Zod-validated config loader
+├── dashboard.html   # Single-file dashboard served at /
+├── index.ts         # Server entry point (API + scheduler)
+└── cli.ts           # CLI entry point (one-off fetches, session import)
 ```
 
 ## Quick Start
 
 ```bash
 pnpm install
-cp .env.example .env   # fill credentials
-pnpm db:migrate && npx tsx scripts/seed-merchants.ts
-pnpm fetch grab grab-dong-day 2026-07-14   # one-off fetch
-pnpm start                                 # scheduler daemon (SCHEDULE_CRON, default 06:30 daily)
+cp .env.example .env      # fill credentials
+pnpm run db:migrate
+npx tsx scripts/seed-merchants.ts
+
+# one-off fetch (note: `pnpm run fetch`, not `pnpm fetch` — pnpm has its own
+# built-in `fetch` command that would shadow the script and do nothing)
+pnpm run fetch grab grab-dong-day 2026-07-26
+
+# or run the long-running server: REST API + dashboard + nightly scheduler
+pnpm start
 ```
 
 If a fetch fails with `needs_human` (login broken — CAPTCHA/OTP/bad password), the scheduler
@@ -34,20 +41,6 @@ skips that account until you import a session captured from browser devtools:
 
 ```bash
 pnpm cli import-session grab-dong-day session.json
-```
-
-## API
-
-`pnpm start` serves a REST API on `PORT` (default 3000). Date params are business
-dates — calendar days in each merchant's timezone.
-
-```
-GET /                                             # dashboard (KPI tiles + orders table, light/dark)
-GET /health
-GET /summary?from=2026-07-01&to=2026-07-14        # cross-platform totals (revenue = completed only)
-GET /orders?from=&to=&platform=&status=&limit=    # newest first; range optional
-GET /orders/:id                                   # full order incl. raw platform payload
-GET /fetch-runs?limit=20                          # did last night's fetch work?
 ```
 
 ## Run as a service (macOS)
@@ -63,6 +56,41 @@ launchctl kickstart -k gui/$(id -u)/com.dongday.delivery-platform               
 launchctl bootout gui/$(id -u)/com.dongday.delivery-platform                                  # stop
 rm ~/Library/LaunchAgents/com.dongday.delivery-platform.plist                                 # remove auto-start
 ```
+
+### Docker
+
+```bash
+docker build -t delivery-platform-server .
+docker run -d --restart=unless-stopped --name delivery-platform-server \
+  --env-file .env -p 3000:3000 -v "$PWD/data:/app/data" delivery-platform-server
+
+# one-off CLI run against the same image
+docker run --rm --env-file .env -v "$PWD/data:/app/data" \
+  delivery-platform-server fetch grab grab-dong-day 2026-07-26
+```
+
+## API
+
+| Route | Purpose |
+|-------|---------|
+| `GET /` | Dashboard: KPI tiles + orders table (light/dark) |
+| `GET /health` | Liveness probe |
+| `GET /accounts` | Configured accounts + current session state |
+| `GET /summary?from=&to=&merchantId=` | Per-day and per-platform totals (revenue = completed only) |
+| `GET /orders?from=&to=&platform=&limit=` | Order rows |
+| `GET /orders/:id` | Full order incl. raw platform payload |
+| `GET /runs` | Recent fetch runs |
+| `POST /fetch` | Manual backfill: `{accountId, from, to}` |
+
+### Which date do totals use?
+
+`/summary` and `/orders` filter on **`report_date`** — the platform's own business
+day — not on `ordered_at`. Grab assigns a statement's business day server-side,
+and it matches neither `createdAt` nor `updatedAt`: an order placed 23:33:58 and
+settled 00:00:38 the next day still lands in the earlier day's report. Only
+`report_date` reconciles with the merchant portal. Use `ordered_at` when the
+question is genuinely "when did customers order", not "what did the platform pay
+out for that day".
 
 ## Language
 

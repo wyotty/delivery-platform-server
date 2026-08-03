@@ -30,6 +30,9 @@ export const orders = sqliteTable('orders', {
   netAmountMinor: integer('net_amount_minor').notNull(),
   currency: text('currency').notNull(),
   orderedAt: text('ordered_at').notNull(),
+  // The platform's own business day ('YYYY-MM-DD'). Reconciles with the platform
+  // dashboard; ordered_at does not — see UnifiedOrder.reportDate.
+  reportDate: text('report_date').notNull(),
   platformTimezone: text('platform_timezone').notNull(),
   updatedAt: text('updated_at').notNull(),
   rawJson: text('raw_json').notNull(), // JSON string
@@ -37,10 +40,10 @@ export const orders = sqliteTable('orders', {
 }, (table) => ({
   // Unique constraint for upsert — CRITICAL: required by onConflictDoUpdate
   platformOrderIdx: uniqueIndex('idx_orders_platform_order').on(table.platform, table.platformOrderId),
-  // Index for the primary query shape: merchant_id + ordered_at range scans
-  merchantDateIdx: index('idx_orders_merchant_date').on(table.merchantId, table.orderedAt),
+  // Index for the primary query shape: merchant_id + report_date range scans
+  merchantDateIdx: index('idx_orders_merchant_report_date').on(table.merchantId, table.reportDate),
   // Index for account-level queries
-  accountIdx: index('idx_orders_account').on(table.accountId, table.orderedAt),
+  accountIdx: index('idx_orders_account').on(table.accountId, table.reportDate),
 }));
 
 export const platformSessions = sqliteTable('platform_sessions', {

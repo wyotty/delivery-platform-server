@@ -1,0 +1,124 @@
+name: CI
+
+# Deliberately NOT triggered by `pull_request`. The deploy job runs on a
+# self-hosted runner that sits inside the LAN and holds real merchant
+# credentials; this repository is public, so a fork PR triggering it would be
+# arbitrary code execution on that host. PR validation happens in ci.yml's
+# `test` job via `pull_request` in a separate workflow if ever needed — keep
+# anything self-hosted off fork-triggered events.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.7.1
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run lint
+
+      - name: Unit tests
+        run: pnpm test
+
+  build:
+    name: Build & push image
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.HARBOR_REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Compute tags
+        id: meta
+        run: |
+          REPO="${{ secrets.HARBOR_REGISTRY }}/stlsw/delivery-platform-server"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "image=$REPO:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.repo }}:${{ github.sha }}
+            ${{ steps.meta.outputs.repo }}:latest
+          # The Playwright base image is ~2GB; without a cache every run re-pulls
+          # and re-installs node_modules from scratch.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to sandbox
+    needs: build
+    runs-on: [self-hosted, sandbox]
+    # Belt and braces: even if the trigger list above is ever widened, never
+    # deploy from anything but the repository's own master branch.
+    if: github.ref == 'refs/heads/master' && github.event.repository.fork == false
+    steps:
+      - name: Pull and restart
+        env:
+          REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          IMAGE="$REGISTRY/stlsw/delivery-platform-server:${GITHUB_SHA}"
+
+          echo "$HARBOR_PASSWORD" | docker login "$REGISTRY" -u "$HARBOR_USERNAME" --password-stdin
+          docker pull "$IMAGE"
+
+          # .env and the SQLite file live on the host, outside the image, so a
+          # redeploy never touches credentials or data.
+          cd /opt/delivery-platform-server
+          docker rm -f delivery-platform-server 2>/dev/null || true
+          docker run -d --restart=unless-stopped \
+            --name delivery-platform-server \
+            --env-file .env \
+            -p 3000:3000 \
+            -v /opt/delivery-platform-server/data:/app/data \
+            "$IMAGE"
+
+      - name: Wait for health
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if [ "$(docker inspect -f '{{.State.Health.Status}}' delivery-platform-server 2>/dev/null)" = "healthy" ]; then
+              echo "healthy after ${i}0s"
+              curl -fsS localhost:3000/health
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Container did not become healthy" >&2
+          docker logs --tail 50 delivery-platform-server >&2
+          exit 1

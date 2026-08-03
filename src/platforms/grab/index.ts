@@ -2,6 +2,7 @@ import {
   PlatformConnector, PlatformAccount, UnifiedOrder, DateRange,
   AuthState, AuthError, SessionStore,
 } from '../../core/types.js';
+import { eachDate } from '../../core/dates.js';
 import { GrabAuthenticator, GrabSession } from './auth.js';
 import { fetchDailyReport } from './api.js';
 import { normalizeOrder } from './normalize.js';
@@ -15,18 +16,35 @@ export class GrabConnector implements PlatformConnector {
     range: DateRange,
     sessionStore: SessionStore,
   ): Promise<UnifiedOrder[]> {
+    // One request per day, never one request for the whole range: Grab decides a
+    // statement's business day server-side, so the requested day is the only
+    // reliable way to know which report an order belongs to. A multi-day request
+    // would collapse that attribution.
+    const orders: UnifiedOrder[] = [];
+    for (const date of eachDate(range.from, range.to)) {
+      orders.push(...await this.fetchOneDay(account, date, sessionStore));
+    }
+    return orders;
+  }
+
+  private async fetchOneDay(
+    account: PlatformAccount,
+    date: string,
+    sessionStore: SessionStore,
+  ): Promise<UnifiedOrder[]> {
+    const day: DateRange = { from: date, to: date };
     const session = await this.auth.getSession(account, sessionStore);
     try {
-      const statements = await fetchDailyReport(session, range, account.timezone);
-      return statements.map(s => normalizeOrder(s, account.id, account.merchantId, account.timezone));
+      const statements = await fetchDailyReport(session, day, account.timezone);
+      return statements.map(s => normalizeOrder(s, account.id, account.merchantId, account.timezone, date));
     } catch (err) {
       if (err instanceof AuthError && err.authState === 'expired') {
         // Force re-login and retry once
         await sessionStore.remove(account.id);
         const newSession = await this.auth.login(account);
         await sessionStore.set(account.id, newSession);
-        const statements = await fetchDailyReport(newSession, range, account.timezone);
-        return statements.map(s => normalizeOrder(s, account.id, account.merchantId, account.timezone));
+        const statements = await fetchDailyReport(newSession, day, account.timezone);
+        return statements.map(s => normalizeOrder(s, account.id, account.merchantId, account.timezone, date));
       }
       throw err;
     }
