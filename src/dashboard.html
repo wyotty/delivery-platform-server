@@ -90,6 +90,23 @@
   .kv { display: grid; grid-template-columns: 130px 1fr; gap: 6px 12px; font-size: 13.5px; margin: 0; }
   .kv dt { color: var(--muted); }
   .kv dd { margin: 0; overflow-wrap: anywhere; }
+  .dlg-body h2 { margin-top: 18px; }
+
+  .items-wrap { overflow-x: auto; }
+  .items th, .items td { padding: 8px 10px; }
+  .items th:first-child, .items td:first-child { padding-left: 0; }
+  .items th:last-child, .items td:last-child { padding-right: 0; }
+  /* th/td default to nowrap for the dense tables above; item names and customer
+     notes are long free text and have to wrap inside a 680px dialog. */
+  .items td { white-space: normal; vertical-align: top; }
+  .items .mods { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .items .mod-group { color: var(--ink-2); }
+  .items .disc { color: var(--serious); }
+  /* A modifier price we could not parse, and lines from a payload that failed its
+     completeness checks: both are "this number is not trustworthy", never decoration. */
+  .items .unparsed { color: var(--serious); border-bottom: 1px dotted currentColor; }
+  .note.suspect { color: var(--serious); }
+  .items tfoot td { border-top: 1px solid var(--grid); font-weight: 600; }
   pre.raw {
     background: var(--page); border: 1px solid var(--grid); border-radius: 8px;
     padding: 10px 12px; overflow: auto; max-height: 320px; font-size: 12px; margin: 14px 0 0;
@@ -241,6 +258,81 @@ async function load() {
 const localDateTime = (iso, tz) =>
   new Intl.DateTimeFormat(undefined, { timeZone: tz, dateStyle: 'medium', timeStyle: 'short' }).format(new Date(iso));
 
+// Modifiers arrive flat but ordered by position, so a group is a run of adjacent
+// rows — no sorting, no lookup table, and modifiers the platform left ungrouped
+// (groupId null) keep their payload order instead of collapsing into one bucket.
+function modifierGroups(modifiers) {
+  const groups = [];
+  for (const m of modifiers) {
+    const key = m.groupId ?? m.groupName;
+    const last = groups[groups.length - 1];
+    if (last && last.key === key && key !== null) last.modifiers.push(m);
+    else groups.push({ key, name: m.groupName, modifiers: [m] });
+  }
+  return groups;
+}
+
+// A price of 0 renders as no price. Free options are the majority (10 of 15 in the
+// sampled orders), so printing '₫0' ten times per dialog costs more than it tells
+// anyone. An UNPARSED price (price_minor NULL) is a different thing entirely — a
+// parser bug on a real amount — and rendering it the same as free is how it stays
+// invisible, since this dialog is the only place anyone ever looks at a modifier.
+// So it shows the platform's raw string, marked.
+const modifierLabel = (m, currency) =>
+  esc(m.name)
+  + (m.quantity > 1 ? ` ×${esc(m.quantity)}` : '')
+  + (m.priceMinor ? ` (${money(m.priceMinor, currency)})`
+    : m.priceMinor == null && m.priceDisplay && m.priceDisplay !== '-'
+      ? ` (<span class="unparsed" title="Price could not be parsed — stored as the platform's raw string">${esc(m.priceDisplay)}</span>)`
+      : '');
+
+function itemsHtml(items, currency, suspect) {
+  // null and [] mean different things: never fetched vs. fetched and genuinely empty.
+  if (items == null) return '<p class="note">Line items have not been fetched for this order.</p>';
+  if (items.length === 0) return '<p class="note">No line items reported.</p>';
+
+  const rows = items.map(it => `
+        <tr>
+          <td>
+            <div>${esc(it.name)}</div>
+            ${modifierGroups(it.modifiers).map(g => `
+            <div class="mods">${g.name ? `<span class="mod-group">${esc(g.name)}:</span> ` : '+ '}${
+              g.modifiers.map(m => modifierLabel(m, currency)).join(', ')}</div>`).join('')}
+            ${it.comment ? `<div class="mods">“${esc(it.comment)}”</div>` : ''}
+            ${it.discounts.map(d => `
+            <div class="mods disc">− ${esc(d.name)}${
+              d.amountMinor == null ? '' : ' ' + money(d.amountMinor, currency)}</div>`).join('')}
+          </td>
+          <td class="num">${esc(it.quantity)}</td>
+          <td class="num">${money(it.unitPriceMinor, currency)}</td>
+          <td class="num">${money(it.lineTotalMinor, currency)}</td>
+        </tr>`).join('');
+
+  // "Items subtotal", never "Revenue": this is the customer-facing gross before item
+  // discounts, while the Net above it is merchant earnings. Same dialog, two very
+  // different numbers — mislabelling one is how the wrong figure gets quoted.
+  //
+  // And when the payload that produced these lines failed its own completeness
+  // checks, the subtotal is exactly the number that comes out short (a 200 carrying
+  // 3 of 5 lines reads ~40% low). It is also the number an operator reconciles
+  // against, so it has to say so rather than look verified.
+  const warning = suspect
+    ? `<p class="note suspect">⚠ These lines came from a payload that failed the platform’s own
+       completeness checks (${esc(suspect)}). The subtotal below is probably incomplete.</p>`
+    : '';
+
+  return warning + `
+    <div class="items-wrap"><table class="items">
+      <thead><tr><th>Item</th><th class="num">Qty</th><th class="num">Unit</th><th class="num">Amount</th></tr></thead>
+      <tbody>${rows}
+      </tbody>
+      <tfoot><tr>
+        <td>Items subtotal</td><td></td><td></td>
+        <td class="num">${money(items.reduce((sum, it) => sum + it.lineTotalMinor, 0), currency)}</td>
+      </tr></tfoot>
+    </table></div>`;
+}
+
 async function openOrder(id) {
   try {
     const o = await getJson(`/orders/${id}`);
@@ -258,6 +350,9 @@ async function openOrder(id) {
         ${kv('Account', esc(o.accountId))}
         ${kv('Merchant', esc(o.merchantId))}
       </dl>
+      <h2>Items</h2>
+      ${itemsHtml(o.items, o.currency, o.itemsSuspect)}
+      ${o.itemsFetchedAt ? `<p class="note">Items last fetched ${esc(localDateTime(o.itemsFetchedAt, o.platformTimezone))}.</p>` : ''}
       <pre class="raw">${esc(JSON.stringify(o.rawJson, null, 2))}</pre>`;
     $('#order-dialog').showModal();
   } catch (err) {

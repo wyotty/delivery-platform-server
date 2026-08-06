@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { Config } from '../config/index.js';
 import { SessionStore } from '../core/types.js';
 import { buildAccount, fetchAndStore } from '../core/fetch-service.js';
-import { getOrder, getSessionState, getSummary, listAccounts, listFetchRuns, listOrders } from '../db/repo.js';
+import { getOrder, getOrderItems, getSessionState, getSummary, listAccounts, listFetchRuns, listOrders } from '../db/repo.js';
 import type { Notifier } from '../notify/index.js';
 
 const dashboardPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'dashboard.html');
@@ -114,14 +114,21 @@ export function buildApi(
     return { range: { from, to }, count: orders.length, orders };
   });
 
-  /** Full order including the raw platform payload — the dashboard's detail view. */
+  /** Full order including the raw platform payload and its lines — the dashboard's detail view. */
   app.get('/orders/:id', async (request, reply) => {
     const parsed = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     if (!parsed.success) return reply.code(400).send({ error: z.treeifyError(parsed.error) });
 
     const row = getOrder(parsed.data.id);
     if (!row) return reply.code(404).send({ error: 'Order not found' });
-    return { ...row, rawJson: JSON.parse(row.rawJson) };
+    return {
+      ...row,
+      rawJson: JSON.parse(row.rawJson),
+      // `null` and `[]` are different answers and callers must be able to tell them
+      // apart: null = the detail call has never succeeded for this order, [] = it did
+      // and the platform reported no lines. itemsFetchedAt (already in ...row) says when.
+      items: row.itemsFetchedAt ? getOrderItems(row.id) : null,
+    };
   });
 
   app.get('/runs', async () => ({ runs: listFetchRuns() }));

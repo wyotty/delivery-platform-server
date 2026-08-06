@@ -1,0 +1,1 @@
+ALTER TABLE `orders` ADD `items_suspect` text;

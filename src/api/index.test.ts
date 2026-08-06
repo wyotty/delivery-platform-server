@@ -137,6 +137,11 @@ test('GET /orders/:id returns the full order with parsed rawJson; 404 when missi
   assert.equal(order.id, id);
   assert.equal(order.platformOrderId, 'ORDER-4');
   assert.deepEqual(order.rawJson, {}); // parsed object, not a JSON string
+  // Present even when null: it is how a caller tells lines from a payload that
+  // failed its completeness checks apart from verified ones, so it can never be
+  // an absent key that reads as "fine".
+  assert.ok('itemsSuspect' in order);
+  assert.equal(order.itemsSuspect, null);
 
   assert.equal((await app.inject({ method: 'GET', url: '/orders/999999' })).statusCode, 404);
   assert.equal((await app.inject({ method: 'GET', url: '/orders/abc' })).statusCode, 400);

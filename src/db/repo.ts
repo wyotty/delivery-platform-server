@@ -4,7 +4,7 @@ import { and, desc, eq, gte, lte, sql } from 'drizzle-orm';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import * as schema from './schema.js';
-import { UnifiedOrder, FetchRun, SessionStore, AuthState } from '../core/types.js';
+import { UnifiedOrder, FetchRun, SessionStore, AuthState, OrderItemDiscount } from '../core/types.js';
 
 // `||` not `??` — .env.example ships an empty `DB_PATH=`, and dotenv turns that
 // into '' which `??` would happily pass through to an anonymous temp database
@@ -51,11 +51,182 @@ export function upsertOrder(order: UnifiedOrder) {
     .run();
 }
 
-// Single transaction for bulk upserts
-export function upsertOrders(orders: UnifiedOrder[]) {
+export interface ItemWriteFailure { platformOrderId: string; error: string }
+
+export interface UpsertOrdersResult {
+  /** Orders whose line items could not be written. Their order-level row still landed. */
+  itemFailures: ItemWriteFailure[];
+  itemsWritten: number;
+}
+
+export function upsertOrders(orders: UnifiedOrder[]): UpsertOrdersResult {
+  // Phase 1 — order-level rows, one transaction, exactly as before. Item payloads
+  // are the new and fragile part; one bad line must not roll back the night's 44
+  // orders along with it.
   db.transaction(() => {
     for (const o of orders) upsertOrder(o);
   });
+
+  // Phase 2 — items, a transaction per order, so a failure costs that order's lines
+  // and nothing else.
+  const itemFailures: ItemWriteFailure[] = [];
+  let itemsWritten = 0;
+  for (const o of orders) {
+    if (!o.items) continue; // undefined = not fetched; never "no items"
+    try {
+      replaceOrderItems(o);
+      itemsWritten++;
+    } catch (err) {
+      itemFailures.push({
+        platformOrderId: o.platformOrderId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return { itemFailures, itemsWritten };
+}
+
+// ===== Order items =====
+
+/** Does this order already have stored lines? Gates the destructive write below. */
+function hasOrderItems(orderId: number): boolean {
+  return db.select({ id: schema.orderItems.id })
+    .from(schema.orderItems)
+    .where(eq(schema.orderItems.orderId, orderId))
+    .limit(1)
+    .get() !== undefined;
+}
+
+/**
+ * Replace an order's stored lines with the ones on the payload.
+ *
+ * Delete-then-insert rather than upsert-and-sweep: an edited order that lost a line
+ * has to converge, and modifiers have no natural key that is provably unique within
+ * a line — an upsert on one could silently merge two real rows into one. The cost
+ * is a surrogate id nobody references; `(order_id, line_key)` is the identity that
+ * survives either way.
+ */
+export function replaceOrderItems(order: UnifiedOrder): void {
+  const items = order.items;
+  if (!items || items.length === 0) throw new Error('No items to write');
+
+  const row = db.select({ id: schema.orders.id })
+    .from(schema.orders)
+    .where(and(
+      eq(schema.orders.platform, order.platform),
+      eq(schema.orders.platformOrderId, order.platformOrderId),
+    ))
+    .get();
+  // Phase 1 committed before this ran, so a missing row can only be a bug.
+  if (!row) throw new Error(`Order row missing: ${order.platform}/${order.platformOrderId}`);
+
+  if (order.itemsSuspect && hasOrderItems(row.id)) {
+    // The payload failed its own completeness checks, and this write deletes before
+    // it inserts. Keeping rows that are possibly stale beats destroying rows that
+    // are definitely real; with nothing stored yet, partial data still wins.
+    throw new Error(`Refusing to overwrite stored items with a suspect payload: ${order.itemsSuspect}`);
+  }
+
+  db.transaction(() => {
+    // Modifiers first, keyed on order_id: one indexed statement that does not lean
+    // on FK cascade being enabled (drizzle-kit's own table rebuilds turn it off).
+    db.delete(schema.orderItemModifiers).where(eq(schema.orderItemModifiers.orderId, row.id)).run();
+    db.delete(schema.orderItems).where(eq(schema.orderItems.orderId, row.id)).run();
+
+    for (const item of items) {
+      const inserted = db.insert(schema.orderItems)
+        .values({
+          orderId: row.id,
+          position: item.position,
+          lineKey: item.lineKey,
+          platformItemId: item.platformItemId,
+          name: item.name,
+          quantity: item.quantity,
+          lineTotalMinor: item.lineTotalMinor,
+          unitPriceMinor: item.unitPriceMinor,
+          baseTotalMinor: item.baseTotalMinor,
+          baseTotalDisplay: item.baseTotalDisplay,
+          discountMinor: item.discountMinor,
+          discountsJson: item.discounts.length > 0 ? JSON.stringify(item.discounts) : null,
+          comment: item.comment,
+          skuId: item.skuId,
+          itemCode: item.itemCode,
+          barcode: item.barcode,
+          currency: order.currency,
+        })
+        .returning({ id: schema.orderItems.id })
+        .get();
+
+      if (item.modifiers.length > 0) {
+        db.insert(schema.orderItemModifiers)
+          .values(item.modifiers.map(m => ({
+            orderId: row.id,
+            orderItemId: inserted.id,
+            position: m.position,
+            groupId: m.groupId,
+            groupName: m.groupName,
+            platformModifierId: m.platformModifierId,
+            name: m.name,
+            quantity: m.quantity,
+            priceMinor: m.priceMinor,
+            priceDisplay: m.priceDisplay,
+          })))
+          .run();
+      }
+    }
+
+    // Stamped only here, never in upsertOrder's conflict set — a night where the
+    // detail call failed must not overwrite a real timestamp with null.
+    db.update(schema.orders)
+      .set({
+        itemsFetchedAt: new Date().toISOString(),
+        // Describes the lines written immediately above, so it is set and cleared
+        // with them: the suspect reason lands with a partial payload, and the next
+        // clean payload that replaces those lines clears it back to NULL. Anything
+        // less and a row stays flagged after it was fixed, or worse, stays clean
+        // after a suspect payload was stored into it.
+        itemsSuspect: order.itemsSuspect ?? null,
+      })
+      .where(eq(schema.orders.id, row.id))
+      .run();
+  });
+}
+
+export type OrderItemModifierRow = typeof schema.orderItemModifiers.$inferSelect;
+export type OrderItemRow = Omit<typeof schema.orderItems.$inferSelect, 'discountsJson'> & {
+  discounts: OrderItemDiscount[];
+  modifiers: OrderItemModifierRow[];
+};
+
+/** An order's lines with their modifiers nested. Two queries, never 1 + N. */
+export function getOrderItems(orderId: number): OrderItemRow[] {
+  const items = db.select()
+    .from(schema.orderItems)
+    .where(eq(schema.orderItems.orderId, orderId))
+    .orderBy(schema.orderItems.position)
+    .all();
+  if (items.length === 0) return [];
+
+  // The denormalized order_id is what makes this one indexed query instead of one per line.
+  const modifiers = db.select()
+    .from(schema.orderItemModifiers)
+    .where(eq(schema.orderItemModifiers.orderId, orderId))
+    .orderBy(schema.orderItemModifiers.orderItemId, schema.orderItemModifiers.position)
+    .all();
+
+  const byItem = new Map<number, OrderItemModifierRow[]>();
+  for (const m of modifiers) {
+    const list = byItem.get(m.orderItemId);
+    if (list) list.push(m);
+    else byItem.set(m.orderItemId, [m]);
+  }
+
+  // Decoded here, so the API hands back structured data and never a JSON string.
+  return items.map(({ discountsJson, ...item }) => ({
+    ...item,
+    discounts: discountsJson ? JSON.parse(discountsJson) as OrderItemDiscount[] : [],
+    modifiers: byItem.get(item.id) ?? [],
+  }));
 }
 
 // ===== Fetch runs =====
@@ -204,7 +375,16 @@ export function getSummary(range: { from: string; to: string; merchantId?: strin
     .all();
 }
 
-/** List orders newest-first. rawJson excluded — it's a blob, fetch it via getOrder. */
+/**
+ * List orders newest-first. rawJson excluded — it's a blob, fetch it via getOrder.
+ *
+ * Carries items_fetched_at but deliberately NOT an item count. The count would cost
+ * a correlated subquery on every one of up to 5000 rows, and it answers nothing this
+ * column doesn't: replaceOrderItems refuses an empty payload, so a fetched order
+ * always has at least one line. NULL here is the only signal that matters in a list
+ * ("which orders in this range never got their detail call?"); how many lines and
+ * what they are is a per-order question, and /orders/:id already answers it.
+ */
 export function listOrders(range: { from: string; to: string; merchantId?: string; platform?: string; limit?: number }) {
   const conditions = [
     gte(schema.orders.reportDate, range.from),
@@ -225,6 +405,7 @@ export function listOrders(range: { from: string; to: string; merchantId?: strin
     currency: schema.orders.currency,
     orderedAt: schema.orders.orderedAt,
     reportDate: schema.orders.reportDate,
+    itemsFetchedAt: schema.orders.itemsFetchedAt,
   })
     .from(schema.orders)
     .where(and(...conditions))
