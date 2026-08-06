@@ -9,15 +9,26 @@ export interface GrabSession {
 export class GrabAuthenticator {
   private readonly COOKIE_MAX_AGE = 3 * 3600; // 3 hours
 
-  /** Get a valid session — checks cache first, logs in if expired/missing */
-  async getSession(account: PlatformAccount, sessionStore: SessionStore): Promise<GrabSession> {
+  /**
+   * A usable cached session, or null when only a full login would produce one.
+   *
+   * Deliberately cannot log in. A "just get me a session" helper that quietly
+   * launches Chromium is a login nobody budgeted for: the caller decides how many
+   * headless logins a run may spend (GrabConnector's LoginBudget), and it can only
+   * decide that if every login goes through it.
+   */
+  async getCachedSession(account: PlatformAccount, sessionStore: SessionStore): Promise<GrabSession | null> {
     const cached = await sessionStore.get(account.id) as GrabSession | null;
-    if (cached && !this.isExpired(cached)) {
-      return cached;
-    }
-    const session = await this.login(account);
-    await sessionStore.set(account.id, session);
-    return session;
+    if (!cached) return null;
+    if (!this.isExpired(cached)) return cached;
+    if (!await this.validateSession(cached)) return null;
+    // COOKIE_MAX_AGE is a guess, and the real session outlives it by many hours —
+    // so ask Grab instead of assuming. Re-stamping records when the cookies were
+    // last known good, which both skips a nightly wasted login and keeps a
+    // long-running per-order loop from tripping a full login halfway through it.
+    const revalidated: GrabSession = { ...cached, fetchedAt: Math.floor(Date.now() / 1000) };
+    await sessionStore.set(account.id, revalidated);
+    return revalidated;
   }
 
   /** Check if cached session is valid with one cheap API call */

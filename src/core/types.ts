@@ -1,4 +1,5 @@
 // src/core/types.ts
+import type { Logger } from 'pino';
 
 export type PlatformName = string; // 'grab' | 'foodpanda' | ... (open-ended)
 
@@ -18,6 +19,84 @@ export interface PlatformAccount {
   credentials: Record<string, string>; // opaque per-platform; stored encrypted in DB
   timezone: string; // IANA timezone name (e.g. 'Asia/Ho_Chi_Minh')
   config: Record<string, unknown>;
+}
+
+/** One modifier/option chosen on an order line. */
+export interface OrderItemModifier {
+  /** The platform's catalog id (Grab: modifierID) — not a SKU; Grab has none on modifiers. */
+  platformModifierId: string | null;
+  groupId: string | null;
+  groupName: string | null;
+  name: string;
+  quantity: number;
+  /**
+   * Price delta in minor units. null means the platform's string did not parse —
+   * never 0, which is indistinguishable from a genuinely free option. Every such
+   * row is findable later: `price_minor IS NULL AND price_display NOT IN ('', '-')`.
+   */
+  priceMinor: number | null;
+  /** The platform's raw price string, kept so a parser fix is a SQL job, not a re-fetch. */
+  priceDisplay: string;
+  /** 0-based index within this line's flattened modifier list. */
+  position: number;
+}
+
+/** A discount applied to a single line (not to the order). */
+export interface OrderItemDiscount {
+  name: string;
+  /**
+   * The amount taken OFF the line, in minor units. Grab names its field
+   * `itemDiscountPriceDisplay`, which reads like the discounted price — it is not:
+   * 67.500 on a 135.000 line under a promo named "GIẢM 50%".
+   */
+  amountMinor: number | null;
+  /** Raw platform string, kept for the same reason as OrderItemModifier.priceDisplay. */
+  amountDisplay: string;
+  type: string | null;
+  funding: string | null;
+}
+
+export interface OrderItem {
+  /** Stable per-line key from the platform (Grab: itemKey). Unique within the order. */
+  lineKey: string;
+  /** The platform's catalog id (Grab: itemID). NOT the merchant's SKU. */
+  platformItemId: string | null;
+  /** Merchant-supplied ids. Always '' on GrabFood — nothing may depend on these. */
+  skuId: string | null;
+  itemCode: string | null;
+  barcode: string | null;
+  name: string;
+  quantity: number;
+  /**
+   * What the whole line came to, in minor units: quantity × unitPriceMinor.
+   * Includes modifiers, precedes item discounts. This is the figure to sum —
+   * Σ over an order's lines is exactly the platform's own order total.
+   */
+  lineTotalMinor: number;
+  /**
+   * ONE unit, including that unit's modifiers (Grab: fare.priceInMin, verbatim).
+   * Verified per-unit against 7 real quantity>1 lines: a qty-2 line reports
+   * priceInMin 69000 on a 138000 line.
+   */
+  unitPriceMinor: number;
+  /**
+   * The line's base before modifiers — already scaled by quantity, unlike
+   * unitPriceMinor. Nullable: parsed from a display string, so null means "did
+   * not parse", never 0.
+   */
+  baseTotalMinor: number | null;
+  baseTotalDisplay: string | null;
+  /**
+   * Σ of this line's discount amounts. null when there are none — and also null
+   * when any one of them failed to parse, because a partial sum is a confidently
+   * wrong number with nothing else in the row to contradict it.
+   */
+  discountMinor: number | null;
+  comment: string | null;
+  /** 0-based index in the platform payload. */
+  position: number;
+  modifiers: OrderItemModifier[];
+  discounts: OrderItemDiscount[];
 }
 
 export interface UnifiedOrder {
@@ -51,6 +130,21 @@ export interface UnifiedOrder {
   updatedAt: string;
   /** Full original platform payload for re-normalization */
   rawJson: unknown;
+  /**
+   * Line items, when the platform exposes them AND the detail fetch succeeded.
+   * `undefined` means "not fetched" and MUST leave stored rows untouched; never
+   * `[]`, because an empty payload is a failed fetch, not an empty order.
+   */
+  items?: OrderItem[];
+  /** Why the per-order detail fetch failed. Order-level data is unaffected. */
+  itemsError?: string;
+  /**
+   * Set when the item payload failed the platform's own completeness checks.
+   * The lines are still worth storing when we have none, but they must never
+   * overwrite lines we already have: a truncated 200 is indistinguishable from
+   * an edited order that genuinely lost a line. Enforced in replaceOrderItems.
+   */
+  itemsSuspect?: string;
 }
 
 export type AuthState = 'valid' | 'expired' | 'needs_human';
@@ -65,6 +159,33 @@ export class AuthError extends Error {
   }
 }
 
+/**
+ * Orders already collected when a fetch aborted, stashed on the error itself.
+ *
+ * Aborting used to be cheap — a day cost one report call. Fetching per-order
+ * detail makes it ~45 sequential calls per day, so a session dying at call #40
+ * would otherwise discard 44 orders that were fetched successfully. Carrying
+ * them on the error keeps the `throw` contract intact (callers that ignore this
+ * behave exactly as before) while letting fetchAndStore persist what it has.
+ *
+ * A symbol, not a field: pino and JSON.stringify must not dump 44 orders into a
+ * log line just because they serialized the error.
+ */
+const PARTIAL_ORDERS = Symbol('partialOrders');
+
+export function attachPartialOrders<E>(err: E, orders: UnifiedOrder[]): E {
+  if (err !== null && typeof err === 'object' && orders.length > 0) {
+    (err as Record<symbol, unknown>)[PARTIAL_ORDERS] = orders;
+  }
+  return err;
+}
+
+export function getPartialOrders(err: unknown): UnifiedOrder[] {
+  if (err === null || typeof err !== 'object') return [];
+  const orders = (err as Record<symbol, unknown>)[PARTIAL_ORDERS];
+  return Array.isArray(orders) ? orders as UnifiedOrder[] : [];
+}
+
 /** Session store interface — implementations persist to DB or memory */
 export interface SessionStore {
   get(accountId: string): Promise<unknown | null>;
@@ -72,14 +193,25 @@ export interface SessionStore {
   remove(accountId: string): Promise<void>;
 }
 
+/** Optional per-call knobs. An options bag so later additions need no signature change. */
+export interface FetchOrdersOptions {
+  logger?: Logger;
+}
+
 export interface PlatformConnector {
   readonly platform: PlatformName;
   /**
    * Fetch orders in the given date range.
    * Throws AuthError if auth expired or broken (surfaced to the scheduler for alerting).
+   * A thrown error may carry the orders fetched before it — see getPartialOrders.
    * Implementations MUST use the injected SessionStore for session caching.
    */
-  fetchOrders(account: PlatformAccount, range: DateRange, sessionStore: SessionStore): Promise<UnifiedOrder[]>;
+  fetchOrders(
+    account: PlatformAccount,
+    range: DateRange,
+    sessionStore: SessionStore,
+    opts?: FetchOrdersOptions,
+  ): Promise<UnifiedOrder[]>;
   /**
    * Check current auth state using the cached session (one cheap API call, no full login).
    * Only performs a full re-login as a last resort.
