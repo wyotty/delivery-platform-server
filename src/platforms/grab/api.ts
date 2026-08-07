@@ -1,5 +1,6 @@
 import { GrabSession } from './auth.js';
 import { DateRange, AuthError } from '../../core/types.js';
+import { parseJsonLossless } from '../../core/json.js';
 
 const BASE_URL = 'https://api.grab.com/delvplatformapi/merchant/v1/reports/daily-pagination';
 const ORDER_DETAIL_URL = 'https://api.grab.com/food/merchant/v3/orders';
@@ -37,8 +38,30 @@ export interface GrabOrder {
     currencySymbol?: string;
     /** Integer minor units, and Σ items[].fare.priceInMin — the completeness check. */
     originalPriceInMin?: number;
-    subTotalDisplay?: string;
+    /**
+     * Everything below is a LOCALE-FORMATTED DISPLAY STRING, not a number: '32.000'
+     * is thirty-two thousand đồng. Every one goes through parseGrabAmount — see
+     * money.ts for why parseFloat here is a silent 1000x error. Grab writes '' or
+     * '-' for "not applicable", which that parser maps to null.
+     *
+     * Sibling fields deliberately left undeclared because they are NOT money and
+     * must never be fed to the parser: taxRate ('0.0000' — a rate), and the
+     * chargeFeeDescription / serviceChargeFeeDescription i18n objects.
+     */
     totalDisplay?: string;
+    subTotalDisplay?: string;
+    /** What the customer paid, as opposed to what the merchant earned. */
+    passengerTotalDisplay?: string;
+    taxDisplay?: string;
+    deliveryFeeDisplay?: string;
+    /** Grab's commission — 'mex' is Grab's shorthand for the merchant throughout. */
+    mexCommissionDisplay?: string;
+    merchantChargeDisplay?: string;
+    smallOrderFeeDisplay?: string;
+    promotionDisplay?: string;
+    totalDiscountAmountDisplay?: string;
+    reducedPriceDisplay?: string;
+    adjustmentByDriverDisplay?: string;
     [key: string]: unknown;
   };
   [key: string]: unknown;
@@ -141,18 +164,56 @@ export async function fetchDailyReport(
       throw new Error(`Grab API error: HTTP ${resp.status}`);
     }
 
-    const data = await resp.json();
-    const statements: GrabStatement[] = data.statements || [];
+    // .text() + parseJsonLossless, never resp.json(): a statement carries the same
+    // int64 `orderFlags` bitfield the detail payload does, and resp.json() rounds it
+    // to the nearest double BEFORE repo.ts stringifies the statement into
+    // orders.raw_json — the identical loss the sibling column was fixed for.
+    //
+    // The verbatim-body trick cannot be reused here: the body is {"statements":[…]}
+    // and raw_json stores ONE element of that array, so there is no single response
+    // to keep. Fidelity has to survive the parse instead, which is exactly what
+    // parseJsonLossless does — the literal is wrapped so the JSON.stringify in
+    // repo.ts re-emits it digit for digit. See core/json.ts.
+    const body = await resp.text();
+    let data: { statements?: GrabStatement[]; hasMore?: boolean } | null;
+    try {
+      data = parseJsonLossless(body) as { statements?: GrabStatement[]; hasMore?: boolean } | null;
+    } catch {
+      // Same reason as the detail endpoint: Grab answers 200 with an HTML
+      // interstitial when it wants a human, and a SyntaxError carrying 8 KB of
+      // markup is not a diagnosis.
+      throw new Error('Grab daily report response is not JSON');
+    }
+    const statements: GrabStatement[] = data?.statements || [];
     allStatements.push(...statements);
     // Driver-independent stop: a short page is the last page. The captured
     // envelope (data/sample-grab-3.json) has no hasMore field, so only trust
     // hasMore when it's explicitly false — `!undefined` would stop at page 0.
     if (statements.length < pageSize) break;
-    if (data.hasMore === false) break;
+    if (data?.hasMore === false) break;
     pageIndex++;
   }
 
   return allStatements;
+}
+
+/**
+ * One order's detail: the response as Grab sent it, plus the parsed view of it.
+ *
+ * Two members and not one because a parse is not reversible. Grab's encoder emits
+ * '&' as a six-character unicode escape (Go's default), and its int64 `orderFlags`
+ * does not fit a double, so `JSON.stringify(JSON.parse(body))` is neither the same
+ * bytes nor, for that field, the same number — verified against a live response.
+ * Whatever gets stored has to come from `raw`; `order` is a projection to read from.
+ */
+export interface GrabOrderDetail {
+  /** The response body verbatim. This is what belongs in orders.detail_raw_json. */
+  raw: string;
+  /**
+   * The `order` object inside it. Parsed by parseJsonLossless, so no numeric value
+   * is corrupted — but re-serializing it is still not the body Grab sent.
+   */
+  order: GrabOrder;
 }
 
 /**
@@ -163,7 +224,7 @@ export async function fetchOrderDetail(
   session: GrabSession,
   orderId: string,
   timeoutMs = 30_000,
-): Promise<GrabOrder> {
+): Promise<GrabOrderDetail> {
   const resp = await fetch(`${ORDER_DETAIL_URL}/${encodeURIComponent(orderId)}`, {
     headers: {
       accept: '*/*',
@@ -180,9 +241,20 @@ export async function fetchOrderDetail(
     throw new Error(`Grab API error: HTTP ${resp.status}`);
   }
 
-  const data = await resp.json();
-  if (!data?.order) throw new Error('Grab order detail response has no order');
-  return data.order as GrabOrder;
+  // .text(), never .json(): the body is the artefact this endpoint exists to
+  // capture, and resp.json() would hand back a value that can no longer produce it.
+  const raw = await resp.text();
+  let data: unknown;
+  try {
+    data = parseJsonLossless(raw);
+  } catch {
+    // Grab answers 200 with an HTML interstitial when it wants a human. Saying so
+    // beats a bare SyntaxError with 8 KB of markup in the message.
+    throw new Error('Grab order detail response is not JSON');
+  }
+  const order = (data as { order?: GrabOrder } | null)?.order;
+  if (!order) throw new Error('Grab order detail response has no order');
+  return { raw, order };
 }
 
 export function formatTzOffset(timezone: string): string {

@@ -1,0 +1,1 @@
+ALTER TABLE `orders` ADD `rejected_detail_raw_json` text;

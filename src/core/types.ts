@@ -28,15 +28,20 @@ export interface OrderItemModifier {
   groupId: string | null;
   groupName: string | null;
   name: string;
-  quantity: number;
+  /** 1 when the platform omits it; null when it sent something that is not a count. */
+  quantity: number | null;
   /**
    * Price delta in minor units. null means the platform's string did not parse —
    * never 0, which is indistinguishable from a genuinely free option. Every such
    * row is findable later: `price_minor IS NULL AND price_display NOT IN ('', '-')`.
    */
   priceMinor: number | null;
-  /** The platform's raw price string, kept so a parser fix is a SQL job, not a re-fetch. */
-  priceDisplay: string;
+  /**
+   * The platform's raw price string, kept so a parser fix is a SQL job, not a
+   * re-fetch. null when the platform sent a non-string — NOT '', which is Grab's
+   * own "printed nothing" sentinel and the value the tripwire query excludes.
+   */
+  priceDisplay: string | null;
   /** 0-based index within this line's flattened modifier list. */
   position: number;
 }
@@ -97,6 +102,44 @@ export interface OrderItem {
   position: number;
   modifiers: OrderItemModifier[];
   discounts: OrderItemDiscount[];
+  /**
+   * The platform's item object, verbatim. Every field above is a projection of it,
+   * and Grab sends ~16 more per line (weight, editedStatus, originalItem, itemTags,
+   * outOfStockInstruction…) that nothing reads yet. Kept so answering a new question
+   * about old orders is a query, not a re-fetch of history Grab may no longer serve.
+   */
+  rawJson: unknown;
+}
+
+/**
+ * The order-level money breakdown, parsed to minor units.
+ *
+ * null is never 0. It means the platform sent one of its "none" sentinels or the
+ * string did not parse — and a 0 there would read as a real, free-of-charge figure.
+ * The *Display members carry the original string for the fields where that
+ * distinction is not otherwise recoverable; see OrderItemModifier.priceDisplay for
+ * the same reasoning one level down.
+ */
+export interface OrderFare {
+  /** What the merchant's own total came to, before the customer-side fees below. */
+  totalMinor: number | null;
+  subtotalMinor: number | null;
+  /** What the CUSTOMER paid. Distinct from UnifiedOrder.netAmountMinor, the merchant's take. */
+  passengerTotalMinor: number | null;
+  taxMinor: number | null;
+  deliveryFeeMinor: number | null;
+  /** The platform's cut (Grab: fare.mexCommissionDisplay). */
+  commissionMinor: number | null;
+  merchantChargeMinor: number | null;
+  smallOrderFeeMinor: number | null;
+  promotionMinor: number | null;
+  totalDiscountMinor: number | null;
+  reducedPriceMinor: number | null;
+  adjustmentByDriverMinor: number | null;
+  merchantChargeDisplay: string | null;
+  promotionDisplay: string | null;
+  totalDiscountDisplay: string | null;
+  adjustmentByDriverDisplay: string | null;
 }
 
 export interface UnifiedOrder {
@@ -136,6 +179,20 @@ export interface UnifiedOrder {
    * `[]`, because an empty payload is a failed fetch, not an empty order.
    */
   items?: OrderItem[];
+  /**
+   * The platform's whole per-order detail response, verbatim — the document `items`
+   * and `fare` were both projected out of. Moves with them: set together, stored
+   * together, so the raw can never describe a different fetch than the columns do.
+   * `undefined` means "not fetched", exactly as it does for `items`.
+   *
+   * The undecoded body, deliberately: a parsed object is not the response. Grab's
+   * encoder emits '&' as a six-character unicode escape, and its int64 `orderFlags`
+   * is 131 away from the nearest double, so re-serializing a parse stores neither
+   * the same bytes nor the same number — and this column is the copy of record.
+   */
+  detailRawJson?: string;
+  /** The money breakdown from that same payload. Absent for the same reason. */
+  fare?: OrderFare;
   /** Why the per-order detail fetch failed. Order-level data is unaffected. */
   itemsError?: string;
   /**

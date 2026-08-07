@@ -50,6 +50,9 @@ async function main() {
       items_written: result.itemsWritten,
       items_missing: result.itemsMissing,
       item_failures: result.itemFailures,
+      // Orders that landed nowhere at all: total_orders above counts what Grab
+      // returned, and this is how many of them are missing from the database.
+      order_failures: result.orderFailures,
     }, null, 2));
   } else if (command === 'backfill') {
     // Existing orders predate line-item collection. This is the same connector, the

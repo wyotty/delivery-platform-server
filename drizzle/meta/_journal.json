@@ -29,6 +29,27 @@
       "when": 1786036110131,
       "tag": "0003_charming_sandman",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1786066720140,
+      "tag": "0004_perfect_malcolm_colcord",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1786069649708,
+      "tag": "0005_cooing_alex_wilder",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1786077111951,
+      "tag": "0006_slim_hedge_knight",
+      "breakpoints": true
     }
   ]
 }

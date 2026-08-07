@@ -111,6 +111,27 @@
     background: var(--page); border: 1px solid var(--grid); border-radius: 8px;
     padding: 10px 12px; overflow: auto; max-height: 320px; font-size: 12px; margin: 14px 0 0;
   }
+  /* Raw payloads are reference material, not reading material. The order detail blob
+     averages ~8 KB and every line carries its own object, so they stay collapsed —
+     open, they'd bury the summary above them. All render through the same pre.raw. */
+  details.raw-box { margin: 14px 0 0; }
+  details.raw-box > summary {
+    cursor: pointer; color: var(--ink-2); font-size: 12.5px; padding: 3px 0;
+    list-style-position: inside;
+  }
+  details.raw-box > summary:hover { color: var(--ink); }
+  details.raw-box > summary:focus-visible { outline: 2px solid var(--muted); outline-offset: 2px; border-radius: 4px; }
+  details.raw-box > pre.raw { margin-top: 6px; }
+  /* Inside a line-item cell the block is one of many, so it sits quieter and shorter. */
+  .items details.raw-box { margin: 4px 0 0; }
+  .items details.raw-box > summary { color: var(--muted); font-size: 12px; }
+  /* And it has to wrap. A <pre> in a table cell sets that column's MIN-content width
+     to its longest line (~80 characters of itemKey), which is wider than the dialog:
+     opening one block doubled the table and scrolled Qty / Unit / Amount — and the
+     Items subtotal — out of view behind .items-wrap's horizontal scroll. It is
+     `anywhere` and not `break-word` because only `anywhere` shrinks min-content,
+     which is the measurement the table is sized from. */
+  .items details.raw-box > pre.raw { max-height: 220px; white-space: pre-wrap; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -201,10 +222,23 @@ function markChip(days) {
     c.setAttribute('aria-pressed', String(c.dataset.days === String(days))));
 }
 
+// res.json() rounds an integer past 2^53 exactly as the server's JSON.parse used to.
+// Grab's orderFlags is an int64 bitfield that now reaches this page with every digit
+// intact, and parsing it normally would put the wrong number back on screen in the
+// one view whose whole job is showing the payload as it is. Same rescue as
+// core/json.ts, feature-detected: without JSON.rawJSON this is plain JSON.parse.
+const parseJson = typeof JSON.rawJSON === 'function'
+  ? text => JSON.parse(text, (key, value, ctx) =>
+      typeof value === 'number' && Number.isInteger(value) && !Number.isSafeInteger(value)
+      && typeof ctx?.source === 'string' && ctx.source !== String(value)
+        ? JSON.rawJSON(ctx.source)
+        : value)
+  : text => JSON.parse(text);
+
 async function getJson(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
-  return res.json();
+  return parseJson(await res.text());
 }
 
 async function load() {
@@ -286,6 +320,13 @@ const modifierLabel = (m, currency) =>
       ? ` (<span class="unparsed" title="Price could not be parsed — stored as the platform's raw string">${esc(m.priceDisplay)}</span>)`
       : '');
 
+// One renderer for every raw payload in the dialog — the statement, the order detail
+// blob and each line's own object. Two implementations is how two blocks drift apart.
+const rawPre = value => `<pre class="raw">${esc(JSON.stringify(value, null, 2))}</pre>`;
+// Callers must not pass a missing payload: JSON.stringify(undefined) is undefined and
+// would print the word. Absence gets a sentence explaining it, not an empty block.
+const rawBox = (label, value) => `<details class="raw-box"><summary>${esc(label)}</summary>${rawPre(value)}</details>`;
+
 function itemsHtml(items, currency, suspect) {
   // null and [] mean different things: never fetched vs. fetched and genuinely empty.
   if (items == null) return '<p class="note">Line items have not been fetched for this order.</p>';
@@ -302,6 +343,7 @@ function itemsHtml(items, currency, suspect) {
             ${it.discounts.map(d => `
             <div class="mods disc">− ${esc(d.name)}${
               d.amountMinor == null ? '' : ' ' + money(d.amountMinor, currency)}</div>`).join('')}
+            ${it.rawJson == null ? '' : rawBox('Raw JSON', it.rawJson)}
           </td>
           <td class="num">${esc(it.quantity)}</td>
           <td class="num">${money(it.unitPriceMinor, currency)}</td>
@@ -321,6 +363,14 @@ function itemsHtml(items, currency, suspect) {
        completeness checks (${esc(suspect)}). The subtotal below is probably incomplete.</p>`
     : '';
 
+  // Lines written before per-item raw capture have rawJson null, so their block is
+  // simply absent. Said once under the table rather than on every line: on an order
+  // that predates capture it is the same sentence repeated for each item.
+  const noRaw = items.filter(it => it.rawJson == null).length;
+  const rawNote = noRaw === 0 ? '' : `
+    <p class="note">${noRaw === items.length ? 'These lines were' : `${noRaw} of ${items.length} lines were`}
+      stored before per-item raw JSON was captured. Re-fetching the order fills it in.</p>`;
+
   return warning + `
     <div class="items-wrap"><table class="items">
       <thead><tr><th>Item</th><th class="num">Qty</th><th class="num">Unit</th><th class="num">Amount</th></tr></thead>
@@ -330,7 +380,34 @@ function itemsHtml(items, currency, suspect) {
         <td>Items subtotal</td><td></td><td></td>
         <td class="num">${money(items.reduce((sum, it) => sum + it.lineTotalMinor, 0), currency)}</td>
       </tr></tfoot>
-    </table></div>`;
+    </table></div>` + rawNote;
+}
+
+/**
+ * The banner for an order whose latest fetch was REFUSED (rejected_detail_raw_json).
+ *
+ * What the stored lines are worth is a second question, and items_suspect is the only
+ * thing that answers it. Both states are reachable and they read very differently:
+ * the refusal gate protects lines it already has, but an order whose FIRST payload
+ * was suspect has those lines stored anyway (partial data beats none — schema.ts),
+ * flagged, and is then frozen with them. Calling them "verified" there would print a
+ * reassurance three lines under the warning saying those same lines failed the
+ * platform's own checks, which is how an operator reconciles against a short total
+ * believing it was cross-checked.
+ */
+function refusedHtml(o) {
+  if (o.rejectedDetailRawJson == null) return '';
+  const stored = o.itemsSuspect
+    ? `Those lines are no baseline either: they came from a payload that failed the same
+       checks (see the warning above the table) and were stored only because there was
+       nothing to lose. Both fetches of this order are doubtful.`
+    : `Those lines are the earlier ones, and they passed those checks.`;
+  return `
+      <p class="note suspect">⚠ A later fetch of this order was refused: its payload failed the
+         platform’s own completeness checks, so it was not allowed to replace the lines above —
+         and this repeats every night until someone looks. ${stored}
+         The refused payload is kept here because the platform will not serve it again.</p>
+      ${rawBox('Refused order detail payload', o.rejectedDetailRawJson)}`;
 }
 
 async function openOrder(id) {
@@ -353,7 +430,12 @@ async function openOrder(id) {
       <h2>Items</h2>
       ${itemsHtml(o.items, o.currency, o.itemsSuspect)}
       ${o.itemsFetchedAt ? `<p class="note">Items last fetched ${esc(localDateTime(o.itemsFetchedAt, o.platformTimezone))}.</p>` : ''}
-      <pre class="raw">${esc(JSON.stringify(o.rawJson, null, 2))}</pre>`;
+      <h2>Raw</h2>
+      ${o.detailRawJson == null
+        ? '<p class="note">The order detail payload has not been captured for this order.</p>'
+        : rawBox('Order detail payload', o.detailRawJson)}
+      ${refusedHtml(o)}
+      ${rawPre(o.rawJson)}`;
     $('#order-dialog').showModal();
   } catch (err) {
     const el = $('#error');

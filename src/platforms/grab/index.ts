@@ -7,7 +7,7 @@ import {
 import { eachDate } from '../../core/dates.js';
 import { GrabAuthenticator, GrabSession } from './auth.js';
 import { fetchDailyReport, fetchOrderDetail } from './api.js';
-import { normalizeOrder, normalizeOrderItems } from './normalize.js';
+import { normalizeOrder, normalizeOrderFare, normalizeOrderItems } from './normalize.js';
 import { grabCurrencyExponent } from './money.js';
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
@@ -139,12 +139,30 @@ export class GrabConnector implements PlatformConnector {
       }
 
       try {
-        const raw = await this.withAuthRetry(account, sessionStore, budget,
+        const payload = await this.withAuthRetry(account, sessionStore, budget,
           s => fetchOrderDetail(s, order.platformOrderId, detail.requestTimeoutMs));
-        const { items, suspect } = normalizeOrderItems(
-          raw, order.platformOrderId, grabCurrencyExponent(statements[i]),
-        );
+        // The statement's own declared exponent, not a guess and not a constant:
+        // it is what makes '32.000' thirty-two thousand here and thirty-two there.
+        const exponent = grabCurrencyExponent(statements[i]);
+        const { items, suspect } = normalizeOrderItems(payload.order, order.platformOrderId, exponent);
+        // Assigned only after normalizeOrderItems has vetted the payload — it throws
+        // on a mismatched order id or empty items, and a payload that failed those
+        // checks must not be stored as this order's raw truth. The three move as one
+        // unit from here on: repo.ts writes them in a single statement.
         order.items = items;
+        // The body, not the parse of it — see UnifiedOrder.detailRawJson.
+        order.detailRawJson = payload.raw;
+        // Eight of the twelve fare figures have no *_display column, so a NULL from
+        // a format change is indistinguishable from Grab's '' / '-' "none" sentinel
+        // in the row itself. This is the only moment it can be said out loud; after
+        // it, finding one means a json_extract over the stored payload. Fires for a
+        // string the parser refuses AND for a field that stopped being sent
+        // ('(absent)'), never for a sentinel — see normalizeOrderFare.
+        order.fare = normalizeOrderFare(payload.order, exponent, (field, display) =>
+          logger?.warn(
+            { orderId: order.platformOrderId, field, display },
+            'Grab fare figure unreadable — column stored as NULL',
+          ));
         if (suspect) {
           order.itemsSuspect = suspect;
           logger?.warn({ orderId: order.platformOrderId, suspect }, 'Item payload failed its completeness checks');
