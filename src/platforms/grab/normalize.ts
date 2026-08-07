@@ -83,21 +83,62 @@ export function normalizeOrderItems(
 
   const items = raw.map((item, position) => normalizeItem(item, position, exponent));
 
-  // Completeness, integer against integer — no parsing inside the guard, because a
-  // guard that can throw on a format change is worse than the truncation it checks
-  // for. A 200 carrying 3 of 5 lines is otherwise indistinguishable from an edited
-  // order that lost two, and replaceOrderItems deletes before it inserts.
+  // Completeness. A 200 carrying 3 of 5 lines is otherwise indistinguishable from an
+  // edited order that genuinely lost two, and replaceOrderItems deletes before it
+  // inserts, so storing a truncated payload understates the order forever.
+  //
+  // Two checks, deliberately independent: a dropped line lowers the unit count AND
+  // the money, so either one alone still catches it. That is what lets the money
+  // check be skippable (below) without weakening the guard.
   const reasons: string[] = [];
   // itemInfo.count counts UNITS, not lines: a single qty-2 line reports count 2.
+  // Integer against integer, so no format change can break it — this is the half of
+  // the gate that keeps working when the money strings move.
   const declaredCount = order.itemInfo?.count;
   const units = items.reduce((n, i) => n + i.quantity, 0);
   if (typeof declaredCount === 'number' && declaredCount > 0 && declaredCount !== units) {
     reasons.push(`itemInfo.count ${declaredCount} != ${units} units`);
   }
+
+  // The money basis is fare.subTotalDisplay: Grab's subtotal OF THE LINES, printed
+  // before the order-level fees and discounts under it. Σ line totals equals it on
+  // all 780 live order payloads surveyed (2026-07-09..08-07, VND) — promo and
+  // non-promo, cancelled, multi-quantity, and the one Grab marks isOrderEdited.
+  //
+  // NOT fare.originalPriceInMin, which this check compared against until it was
+  // measured: over the same 780 it disagreed with the lines on 10. Nine ran HIGH by
+  // 10k–144k on complete, internally consistent COMPLETED orders with no discount,
+  // no edit and a null orderChangeLog (001560564535 263000 vs 169000; 001808930715
+  // 348000 vs 262000; 001756986344 144000 vs 134000; 001171350913 202000 vs
+  // 128000, and five more), and the tenth ran LOW: on the edited order 001401453 it
+  // stayed at the pre-edit 238000 while the lines totalled 248000 — which is
+  // exactly the direction a truncation looks like, so it cannot be told apart from
+  // one. A figure that lands on both sides of the truth is not a truncation signal.
+  // It refused those ten nightly, and refusing means the stored lines stop updating.
+  //
+  // NOT fare.revampedSubtotalDisplay, which is the same subtotal AFTER discount: it
+  // sits below Σ on 123 of the 780, each one an order whose discount comes off the
+  // lines (on 001510457039 it is exactly 254000 - 67500 = 186500).
+  //
+  // NOT fare.subtotalIncludeMerchantCharge, which equals Σ on all 780 too — but only
+  // because this account has never levied one (merchantChargeDisplay is '' on every
+  // one of the 780). It adds a fee that is not a line, so it would part company with
+  // the lines the day a packaging charge is configured.
+  //
+  // Parsed, not integer-compared, because Grab prints this one as a display string —
+  // which is why null is "no check" and never "suspect": a renamed key, a '' / '-'
+  // sentinel or a reformatted string must not freeze an order's lines over a
+  // comparator we could not read. The unit count above is what still holds then.
   const sum = items.reduce((n, i) => n + i.lineTotalMinor, 0);
-  const declaredTotal = order.fare?.originalPriceInMin;
-  if (typeof declaredTotal === 'number' && sum !== declaredTotal) {
-    reasons.push(`line totals ${sum} != fare.originalPriceInMin ${declaredTotal}`);
+  // typeof before the parser for the same reason as normalizeOrderFare's guard: the
+  // declared `string | undefined` is a claim about a remote payload, and this fare
+  // object already carries {en, vi, …} i18n objects on two of its members.
+  const subtotalDisplay = order.fare?.subTotalDisplay;
+  const declaredSubtotal = typeof subtotalDisplay === 'string'
+    ? optionalAmount(subtotalDisplay, exponent)
+    : null;
+  if (declaredSubtotal !== null && sum !== declaredSubtotal) {
+    reasons.push(`line totals ${sum} != fare.subTotalDisplay ${declaredSubtotal}`);
   }
 
   return reasons.length > 0 ? { items, suspect: reasons.join('; ') } : { items };
@@ -290,18 +331,23 @@ function normalizeItem(item: GrabOrderItem, position: number, exponent: number):
 }
 
 /**
- * A PER-LINE display string as minor units, or null when the parser refuses it.
+ * A Grab display string as minor units, or null when the parser refuses it.
  *
- * Swallowing the throw is defensible here because of what each of the three callers
- * does with the original: a modifier price keeps price_display, a line base keeps
- * base_total_display, and an item discount keeps amountDisplay inside discounts_json.
- * So a null that came from a format change stays separable from Grab's '' / '-'
- * "none" sentinel, and correcting the parser later is an UPDATE over stored strings
- * rather than a re-fetch of history the platform will not serve twice:
+ * Swallowing the throw is defensible for the three PER-LINE callers because of what
+ * each does with the original: a modifier price keeps price_display, a line base
+ * keeps base_total_display, and an item discount keeps amountDisplay inside
+ * discounts_json. So a null that came from a format change stays separable from
+ * Grab's '' / '-' "none" sentinel, and correcting the parser later is an UPDATE over
+ * stored strings rather than a re-fetch of history the platform will not serve twice:
  *   WHERE price_minor IS NULL AND price_display NOT IN ('', '-')
  * Losing an entire order's lines over one unreadable modifier price would be the
  * worse trade — line_total_minor comes from an integer Grab sends outright and is
  * unaffected by any of this.
+ *
+ * The fourth caller is the completeness gate, and it stores nothing: null there
+ * means the subtotal could not be read, so that half of the gate does not run. A
+ * comparator we cannot parse must not become a suspect verdict — that would freeze
+ * an order's lines over a renamed field — and the unit-count check needs no parsing.
  *
  * normalizeOrderFare deliberately does NOT route through here. Eight of its twelve
  * figures have no companion column, so the same silence would leave nothing to find

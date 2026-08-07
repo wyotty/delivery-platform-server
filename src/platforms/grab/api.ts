@@ -36,7 +36,17 @@ export interface GrabOrder {
   itemInfo?: { count?: number; items?: GrabOrderItem[] | null } | null;
   fare?: {
     currencySymbol?: string;
-    /** Integer minor units, and Σ items[].fare.priceInMin — the completeness check. */
+    /**
+     * Integer minor units, and NOT the sum of the lines — despite reading like it.
+     * No code reads this any more; it stays declared as a warning, because assuming
+     * it is the line total is the mistake the completeness gate in normalize.ts made.
+     *
+     * Measured over 780 live order payloads (2026-07-09..08-07): it disagreed with
+     * Σ line totals on 10 — high by 10k–144k on nine complete, undiscounted,
+     * unedited COMPLETED orders, and LOW on the one edited order, where it kept the
+     * pre-edit figure. Some pre-discount / pre-edit basis that tracks neither the
+     * lines nor any discount the payload carries. subTotalDisplay is what reconciles.
+     */
     originalPriceInMin?: number;
     /**
      * Everything below is a LOCALE-FORMATTED DISPLAY STRING, not a number: '32.000'
@@ -49,6 +59,13 @@ export interface GrabOrder {
      * chargeFeeDescription / serviceChargeFeeDescription i18n objects.
      */
     totalDisplay?: string;
+    /**
+     * The subtotal OF THE LINES, before the order-level fees and discounts below it
+     * — so Σ (item quantity × fare.priceInMin) reconciles against this one, and the
+     * completeness gate in normalize.ts uses it. Not revampedSubtotalDisplay, which
+     * is the same figure AFTER discount, nor subtotalIncludeMerchantCharge, which
+     * adds a fee that is not a line.
+     */
     subTotalDisplay?: string;
     /** What the customer paid, as opposed to what the merchant earned. */
     passengerTotalDisplay?: string;

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { normalizeOrder, normalizeOrderFare, normalizeOrderItems } from './normalize.js';
+import { parseGrabAmount } from './money.js';
 import { GrabOrder, GrabStatement } from './api.js';
 
 const fixtures = JSON.parse(readFileSync(new URL('../../../data/sample-orders-for-mapping.json', import.meta.url), 'utf8'));
@@ -193,13 +194,81 @@ test('itemInfo.count counts units, not lines — a quantity-2 order is not suspe
   assert.equal(items.reduce((n, i) => n + i.quantity, 0), 3);
 });
 
-test('line totals sum to fare.originalPriceInMin on every captured order', () => {
-  assert.equal(details.length, 4);
+test('line totals sum to fare.subTotalDisplay on every captured order', () => {
+  // The basis, and the whole gate: Σ line totals is the subtotal OF THE LINES, which
+  // is what subTotalDisplay prints — before the order-level fees and discounts under
+  // it. True on all 780 live order payloads surveyed (2026-07-09..08-07) and on all
+  // eight captured here, across promo, non-promo, cancelled and multi-quantity.
+  assert.equal(details.length, 8);
   for (const src of details) {
     const { items, suspect } = normItems(structuredClone(src));
     const sum = items.reduce((n, i) => n + i.lineTotalMinor, 0);
-    assert.equal(sum, src.fare!.originalPriceInMin, src.orderID);
+    assert.equal(sum, parseGrabAmount(src.fare!.subTotalDisplay, 0), src.orderID);
     assert.equal(suspect, undefined, src.orderID);
+  }
+});
+
+test('the four orders the originalPriceInMin basis refused are complete, and pass', () => {
+  // Real captured payloads, all four COMPLETED, isOrderEdited false, orderChangeLog
+  // null, itemInfo.count equal to the units. Nothing is missing from any of them —
+  // originalPriceInMin simply is not the figure the lines add up to, and comparing
+  // against it froze these orders' line items nightly.
+  //
+  // 001560564535 is the worked example: one line, base 139.000 plus the modifier
+  // 🖤Sốt Tiêu Đen 30.000 = 169000 = fare.priceInMin, and subTotalDisplay says
+  // 169.000 while originalPriceInMin says 263000.
+  const REFUSED: [string, number, number][] = [
+    // orderID, Σ line totals (= subTotalDisplay), fare.originalPriceInMin
+    ['001560564535-C8CUHF4XTK3TCJ', 169000, 263000],
+    ['001808930715-C8CXCEEASATFHA', 262000, 348000],
+    ['001756986344-C8CXTCK2CKE2CT', 134000, 144000],
+    ['001171350913-C8CXRXCWG6BHA2', 128000, 202000],
+  ];
+
+  for (const [orderId, sum, originalPriceInMin] of REFUSED) {
+    const src = detail(orderId);
+    assert.equal(src.state, 'COMPLETED', orderId);
+    assert.equal(src.isOrderEdited, false, orderId);
+    assert.equal(src.orderChangeLog, null, orderId);
+
+    const { items, suspect } = normItems(src);
+    assert.equal(suspect, undefined, orderId);
+    assert.equal(items.reduce((n, i) => n + i.lineTotalMinor, 0), sum, orderId);
+    assert.equal(items.reduce((n, i) => n + i.quantity, 0), src.itemInfo!.count, orderId);
+    assert.equal(parseGrabAmount(src.fare!.subTotalDisplay, 0), sum, orderId);
+    // The old basis, pinned: it is off by 10k–94k on payloads with nothing wrong.
+    assert.equal(src.fare!.originalPriceInMin, originalPriceInMin, orderId);
+    assert.notEqual(src.fare!.originalPriceInMin, sum, orderId);
+  }
+
+  // The worked example, line by line.
+  const { items } = normItems(detail('001560564535-C8CUHF4XTK3TCJ'));
+  assert.equal(items.length, 1);
+  assert.equal(items[0].baseTotalMinor, 139000);
+  assert.deepEqual(
+    items[0].modifiers.filter(m => m.priceMinor !== 0).map(m => [m.name, m.priceMinor]),
+    [['🖤Sốt Tiêu Đen', 30000]],
+  );
+  assert.equal(items[0].lineTotalMinor, 169000); // 139.000 + 30.000
+});
+
+test('the two subtotal look-alikes are NOT the basis, and the payloads say why', () => {
+  // revampedSubtotalDisplay is the subtotal AFTER discount — below Σ on 123 of the
+  // 780 surveyed, so using it would have flagged every one of them. This fixture is
+  // the mechanism in one order: the discount comes straight off the line subtotal.
+  const promo = detail(ITEM_DISCOUNT);
+  const { items } = normItems(promo);
+  const sum = items.reduce((n, i) => n + i.lineTotalMinor, 0);
+  assert.equal(sum, 254000);
+  assert.equal(promo.fare!.subTotalDisplay, '254.000');
+  assert.equal(promo.fare!['revampedSubtotalDisplay'], '186.500'); // 254000 - 67500
+
+  // subtotalIncludeMerchantCharge equals Σ on all 780 — but only because this account
+  // has never levied one: merchantChargeDisplay is '' on every captured order. It
+  // adds a fee that is not a line, so it is the wrong thing to reconcile against.
+  for (const src of details) {
+    assert.equal(src.fare!.merchantChargeDisplay, '', src.orderID);
+    assert.equal(src.fare!['subtotalIncludeMerchantCharge'], src.fare!.subTotalDisplay, src.orderID);
   }
 });
 
@@ -265,14 +334,106 @@ test("a modifier priced '' is null, not 0 — the sentinel is not a free option"
 
 test('a truncated payload is flagged suspect, not trusted', () => {
   // A 200 carrying 1 of 2 lines is indistinguishable from an edited order that
-  // lost one — except that the declared totals stop reconciling.
+  // lost one — except that the declared totals stop reconciling. This is the whole
+  // reason the gate exists, and moving the basis to subTotalDisplay must not cost
+  // it: the fare is left exactly as Grab sent it, only a line is dropped.
   const src = detail(MULTI_QTY);
+  const fareBefore = structuredClone(src.fare);
   src.itemInfo!.items!.pop();
   const { items, suspect } = normItems(src);
 
   assert.equal(items.length, 1);
+  assert.deepEqual(src.fare, fareBefore, 'the fare is untouched — only lines went missing');
   assert.match(suspect!, /itemInfo\.count 3 != 2 units/);
-  assert.match(suspect!, /line totals 218000 != fare\.originalPriceInMin 317000/);
+  assert.match(suspect!, /line totals 218000 != fare\.subTotalDisplay 317000/);
+});
+
+test('a truncated multi-line payload is flagged on EVERY line that could go missing', () => {
+  // 001808930715 is one of the four the old basis refused, and it is the useful
+  // shape for this: three real lines, three ways to lose one. Whole and it passes;
+  // one line short, in any position, and it is caught.
+  const whole = detail('001808930715-C8CXCEEASATFHA');
+  assert.equal(normItems(whole).suspect, undefined);
+
+  const LINES: [number, number][] = [[0, 123000], [1, 203000], [2, 198000]]; // dropped index, Σ left
+  for (const [drop, remaining] of LINES) {
+    const src = detail('001808930715-C8CXCEEASATFHA');
+    src.itemInfo!.items!.splice(drop, 1);
+    const { items, suspect } = normItems(src);
+    assert.equal(items.length, 2, `dropped line ${drop}`);
+    assert.match(suspect!, /itemInfo\.count 3 != 2 units/, `dropped line ${drop}`);
+    assert.match(suspect!, new RegExp(`line totals ${remaining} != fare\\.subTotalDisplay 262000`));
+  }
+});
+
+test('either half of the gate catches a truncation on its own', () => {
+  // They are independent on purpose, because each covers the other's blind spot: a
+  // payload that stops declaring a count is still caught by the money, and a money
+  // format change still leaves the count. Both are shown here against the SAME
+  // truncation, with the other half disabled.
+  const truncateFiveLine = (): GrabOrder => {
+    const src = detail(MULTI_ITEM); // 5 lines, Σ 548000, subTotalDisplay '548.000'
+    src.itemInfo!.items!.pop();     // drop the last line (99000)
+    return src;
+  };
+
+  // Money alone: no count to check against.
+  const noCount = truncateFiveLine();
+  delete noCount.itemInfo!.count;
+  const moneyOnly = normItems(noCount).suspect;
+  assert.doesNotMatch(moneyOnly!, /itemInfo\.count/);
+  assert.match(moneyOnly!, /line totals 449000 != fare\.subTotalDisplay 548000/);
+
+  // Count alone: the subtotal is a string the parser refuses, so that half is off.
+  const noSubtotal = truncateFiveLine();
+  noSubtotal.fare!.subTotalDisplay = '₫548.000';
+  const countOnly = normItems(noSubtotal).suspect;
+  assert.match(countOnly!, /itemInfo\.count 5 != 4 units/);
+  assert.doesNotMatch(countOnly!, /subTotalDisplay/);
+
+  // And a truncation with neither available is the one case nothing can catch —
+  // pinned so that removing a check is a visible change, not a silent one.
+  const blind = truncateFiveLine();
+  delete blind.itemInfo!.count;
+  delete blind.fare!.subTotalDisplay;
+  assert.equal(normItems(blind).suspect, undefined);
+});
+
+test('an unreadable or absent subtotal is NOT a suspect verdict', () => {
+  // A comparator we cannot parse means the check does not run. Flagging instead
+  // would freeze a complete order's line items over a renamed key or a reformatted
+  // string — replaceOrderItems refuses to overwrite stored lines with a suspect
+  // payload, so a false positive here costs the order its future updates.
+  for (const subTotalDisplay of ['', '-', '₫548.000', '5.48', undefined, null, 548000, { en: '548.000' }, ['548.000']]) {
+    const src = detail(MULTI_ITEM);
+    if (subTotalDisplay === undefined) delete src.fare!.subTotalDisplay;
+    else (src.fare as Record<string, unknown>).subTotalDisplay = subTotalDisplay;
+
+    const { items, suspect } = normItems(src);
+    assert.equal(items.length, 5, JSON.stringify(subTotalDisplay));
+    assert.equal(suspect, undefined, JSON.stringify(subTotalDisplay));
+  }
+
+  // A fare object that is gone entirely, likewise: the count is what still holds.
+  const noFare = detail(MULTI_ITEM);
+  noFare.fare = undefined;
+  assert.equal(normItems(noFare).suspect, undefined);
+  noFare.itemInfo!.items!.pop();
+  assert.match(normItems(noFare).suspect!, /itemInfo\.count 5 != 4 units/);
+});
+
+test('a subtotal that disagrees IS flagged — the check is live, not decorative', () => {
+  // The mirror of the test above: null means "unreadable", and only a subtotal that
+  // parsed and came out different may set the flag.
+  const src = detail(MULTI_ITEM);
+  src.fare!.subTotalDisplay = '549.000';
+  assert.match(normItems(src).suspect!, /line totals 548000 != fare\.subTotalDisplay 549000/);
+
+  // Parsed as VND, not as a float: '548.000' is the subtotal, and a gate that read
+  // it as 548 would flag every order on the platform.
+  const vnd = detail(MULTI_ITEM);
+  assert.equal(vnd.fare!.subTotalDisplay, '548.000');
+  assert.equal(normItems(vnd).suspect, undefined);
 });
 
 test('a detail response for a different order throws — it is never written onto ours', () => {
@@ -392,7 +553,7 @@ test('every fare figure on every captured order is its display string with the g
     ['adjustmentByDriverMinor', 'adjustmentByDriverDisplay'],
   ] as const;
 
-  assert.equal(details.length, 4);
+  assert.equal(details.length, 8);
   let checked = 0;
   for (const src of details) {
     const fare = normalizeOrderFare(src, 0) as unknown as Record<string, number | string | null>;
@@ -408,7 +569,7 @@ test('every fare figure on every captured order is its display string with the g
       checked++;
     }
   }
-  assert.equal(checked, 48);
+  assert.equal(checked, 96);
 });
 
 test("the 1000x guard: '32.000' delivery fee in VND is 32000, not 32", () => {

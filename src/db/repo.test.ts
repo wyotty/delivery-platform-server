@@ -186,10 +186,16 @@ test('an edited order that lost a line leaves no stale rows', () => {
   // What Grab actually returns after an edit: the line is gone AND the declared
   // totals are recomputed. Dropping the line alone would trip the completeness
   // guard, which is the next test.
+  //
+  // subTotalDisplay is the figure that moves, verified against the one live order
+  // this account has with isOrderEdited true (001401453-C8CHR7BTRLLBWE): its
+  // subTotalDisplay follows the edited lines exactly, while originalPriceInMin
+  // stays on the pre-edit basis and ends up BELOW them. Which is why the gate
+  // reconciles against the subtotal — see normalizeOrderItems.
   const edited = detail(MULTI_QTY);
   edited.itemInfo!.items!.shift();
   edited.itemInfo!.count = 1;
-  edited.fare!.originalPriceInMin = 99000;
+  edited.fare!.subTotalDisplay = '99.000';
   edited.isOrderEdited = true;
 
   const result = upsertOrders([withItems(edited)]);
