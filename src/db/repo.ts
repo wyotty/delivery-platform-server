@@ -4,7 +4,9 @@ import { and, desc, eq, gte, lte, sql } from 'drizzle-orm';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import * as schema from './schema.js';
-import { UnifiedOrder, FetchRun, SessionStore, AuthState, OrderItemDiscount } from '../core/types.js';
+import { UnifiedOrder, FetchRun, SessionStore, AuthState, OrderFare, OrderItemDiscount } from '../core/types.js';
+import { parseJsonLossless } from '../core/json.js';
+import { orderLabel, unstorableReason } from '../core/order-guard.js';
 
 // `||` not `??` — .env.example ships an empty `DB_PATH=`, and dotenv turns that
 // into '' which `??` would happily pass through to an anonymous temp database
@@ -52,26 +54,71 @@ export function upsertOrder(order: UnifiedOrder) {
 }
 
 export interface ItemWriteFailure { platformOrderId: string; error: string }
+/** An order nothing at all could be stored for, and why. Same shape, worse loss. */
+export interface OrderWriteFailure { platformOrderId: string; error: string }
 
 export interface UpsertOrdersResult {
+  /**
+   * Orders that could not be written AT ALL — no row, so they are in no total and no
+   * report. Named, with the field that stopped them; see core/order-guard.ts.
+   */
+  orderFailures: OrderWriteFailure[];
   /** Orders whose line items could not be written. Their order-level row still landed. */
   itemFailures: ItemWriteFailure[];
+  /**
+   * The orders whose order-level row actually landed. Any tally the caller derives
+   * has to come from this and not from what it handed in: a rejected order's figures
+   * are precisely the ones that could not be read, so summing them produces a
+   * revenue of '0[object Object]' rather than a number.
+   */
+  stored: UnifiedOrder[];
   itemsWritten: number;
 }
 
 export function upsertOrders(orders: UnifiedOrder[]): UpsertOrdersResult {
+  // Vetted before the transaction opens, so a malformed order is never a statement
+  // the transaction has to survive — and phase 2 never goes looking for a row that
+  // was never written.
+  const orderFailures: OrderWriteFailure[] = [];
+  const storable: UnifiedOrder[] = [];
+  for (const o of orders) {
+    const reason = unstorableReason(o);
+    if (reason) orderFailures.push({ platformOrderId: orderLabel(o), error: reason });
+    else storable.push(o);
+  }
+
   // Phase 1 — order-level rows, one transaction, exactly as before. Item payloads
   // are the new and fragile part; one bad line must not roll back the night's 44
   // orders along with it.
+  //
+  // The per-order catch is a BACKSTOP for what the guard above cannot enumerate: an
+  // unserializable rawJson, an account row deleted out from under us. A failed
+  // statement rolls back only itself, so this stays one transaction and still commits
+  // every order that worked (verified against this schema). It is not a substitute
+  // for the guard — the coercions the guard exists for raise nothing to catch, and a
+  // bind error names neither the order nor the field.
+  const stored: UnifiedOrder[] = [];
   db.transaction(() => {
-    for (const o of orders) upsertOrder(o);
+    for (const o of storable) {
+      try {
+        upsertOrder(o);
+        stored.push(o);
+      } catch (err) {
+        orderFailures.push({
+          platformOrderId: orderLabel(o),
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   });
 
   // Phase 2 — items, a transaction per order, so a failure costs that order's lines
-  // and nothing else.
+  // and nothing else. Over `stored`, not `orders`: an order with no row would fail
+  // here a second time, reported as a missing row rather than as the field that
+  // actually stopped it.
   const itemFailures: ItemWriteFailure[] = [];
   let itemsWritten = 0;
-  for (const o of orders) {
+  for (const o of stored) {
     if (!o.items) continue; // undefined = not fetched; never "no items"
     try {
       replaceOrderItems(o);
@@ -83,7 +130,7 @@ export function upsertOrders(orders: UnifiedOrder[]): UpsertOrdersResult {
       });
     }
   }
-  return { itemFailures, itemsWritten };
+  return { orderFailures, itemFailures, stored, itemsWritten };
 }
 
 // ===== Order items =====
@@ -124,6 +171,17 @@ export function replaceOrderItems(order: UnifiedOrder): void {
     // The payload failed its own completeness checks, and this write deletes before
     // it inserts. Keeping rows that are possibly stale beats destroying rows that
     // are definitely real; with nothing stored yet, partial data still wins.
+    //
+    // Refusing the WRITE is not a reason to throw the payload away: it is the only
+    // record of what Grab returned, the refusal repeats every night until a human
+    // looks, and the endpoint will not serve that night twice. Its own column, so
+    // detail_raw_json keeps describing the lines that are actually stored.
+    if (order.detailRawJson != null) {
+      db.update(schema.orders)
+        .set({ rejectedDetailRawJson: order.detailRawJson })
+        .where(eq(schema.orders.id, row.id))
+        .run();
+    }
     throw new Error(`Refusing to overwrite stored items with a suspect payload: ${order.itemsSuspect}`);
   }
 
@@ -153,6 +211,7 @@ export function replaceOrderItems(order: UnifiedOrder): void {
           itemCode: item.itemCode,
           barcode: item.barcode,
           currency: order.currency,
+          rawJson: JSON.stringify(item.rawJson),
         })
         .returning({ id: schema.orderItems.id })
         .get();
@@ -186,16 +245,58 @@ export function replaceOrderItems(order: UnifiedOrder): void {
         // less and a row stays flagged after it was fixed, or worse, stays clean
         // after a suspect payload was stored into it.
         itemsSuspect: order.itemsSuspect ?? null,
+        // The document the lines above came out of, and the money parsed from it —
+        // in this same statement for the same reason as items_suspect. Stored and
+        // replaced as one unit, so detail_raw_json always describes the fetch that
+        // produced the rows sitting beside it, and no fare figure can outlive the
+        // payload it was read from.
+        //
+        // Written as handed over, NOT re-serialized: it is already the response body
+        // (UnifiedOrder.detailRawJson), and a JSON.stringify here is exactly the step
+        // that used to round `orderFlags` on its way into the column.
+        detailRawJson: order.detailRawJson ?? null,
+        // This payload was accepted, so nothing is being refused any more.
+        rejectedDetailRawJson: null,
+        ...fareColumns(order.fare),
       })
       .where(eq(schema.orders.id, row.id))
       .run();
   });
 }
 
+/**
+ * Every fare column, always — a partial set would let a figure parsed from an
+ * earlier payload survive alongside lines from a later one, which is precisely the
+ * raw-vs-parsed disagreement that storing both is meant to make impossible. `??`
+ * rather than `||`: a genuine 0 (taxDisplay is '0' on most orders) must stay 0.
+ */
+function fareColumns(fare: OrderFare | undefined) {
+  return {
+    fareTotalMinor: fare?.totalMinor ?? null,
+    fareSubtotalMinor: fare?.subtotalMinor ?? null,
+    farePassengerTotalMinor: fare?.passengerTotalMinor ?? null,
+    fareTaxMinor: fare?.taxMinor ?? null,
+    fareDeliveryFeeMinor: fare?.deliveryFeeMinor ?? null,
+    fareCommissionMinor: fare?.commissionMinor ?? null,
+    fareMerchantChargeMinor: fare?.merchantChargeMinor ?? null,
+    fareSmallOrderFeeMinor: fare?.smallOrderFeeMinor ?? null,
+    farePromotionMinor: fare?.promotionMinor ?? null,
+    fareTotalDiscountMinor: fare?.totalDiscountMinor ?? null,
+    fareReducedPriceMinor: fare?.reducedPriceMinor ?? null,
+    fareAdjustmentByDriverMinor: fare?.adjustmentByDriverMinor ?? null,
+    fareMerchantChargeDisplay: fare?.merchantChargeDisplay ?? null,
+    farePromotionDisplay: fare?.promotionDisplay ?? null,
+    fareTotalDiscountDisplay: fare?.totalDiscountDisplay ?? null,
+    fareAdjustmentByDriverDisplay: fare?.adjustmentByDriverDisplay ?? null,
+  };
+}
+
 export type OrderItemModifierRow = typeof schema.orderItemModifiers.$inferSelect;
-export type OrderItemRow = Omit<typeof schema.orderItems.$inferSelect, 'discountsJson'> & {
+export type OrderItemRow = Omit<typeof schema.orderItems.$inferSelect, 'discountsJson' | 'rawJson'> & {
   discounts: OrderItemDiscount[];
   modifiers: OrderItemModifierRow[];
+  /** Decoded, never the stored string. null only for lines written before raw capture. */
+  rawJson: unknown;
 };
 
 /** An order's lines with their modifiers nested. Two queries, never 1 + N. */
@@ -222,9 +323,13 @@ export function getOrderItems(orderId: number): OrderItemRow[] {
   }
 
   // Decoded here, so the API hands back structured data and never a JSON string.
-  return items.map(({ discountsJson, ...item }) => ({
+  // The raw goes through parseJsonLossless: a plain JSON.parse would re-introduce
+  // on the read path exactly the rounding the write path was fixed to avoid, and
+  // the API serializes whatever this returns straight back out.
+  return items.map(({ discountsJson, rawJson, ...item }) => ({
     ...item,
     discounts: discountsJson ? JSON.parse(discountsJson) as OrderItemDiscount[] : [],
+    rawJson: rawJson ? parseJsonLossless(rawJson) : null,
     modifiers: byItem.get(item.id) ?? [],
   }));
 }

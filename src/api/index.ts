@@ -7,6 +7,7 @@ import type { Logger } from 'pino';
 import { z } from 'zod';
 import { Config } from '../config/index.js';
 import { SessionStore } from '../core/types.js';
+import { parseJsonLossless } from '../core/json.js';
 import { buildAccount, fetchAndStore } from '../core/fetch-service.js';
 import { getOrder, getOrderItems, getSessionState, getSummary, listAccounts, listFetchRuns, listOrders } from '../db/repo.js';
 import type { Notifier } from '../notify/index.js';
@@ -122,11 +123,25 @@ export function buildApi(
     const row = getOrder(parsed.data.id);
     if (!row) return reply.code(404).send({ error: 'Order not found' });
     return {
+      // ...row carries the fare_* columns as-is: they are already integers in minor
+      // units, and re-deriving them client-side is what money.ts exists to prevent.
       ...row,
-      rawJson: JSON.parse(row.rawJson),
+      // parseJsonLossless, not JSON.parse, on every raw column: they hold Grab's
+      // int64 orderFlags intact — the daily statement carries one of its own, not
+      // just the detail payload — and a plain parse here would round it back out on
+      // the way to the client, a right answer in the database that nobody can read.
+      rawJson: parseJsonLossless(row.rawJson),
+      // Objects, not strings. Both raw payloads are handed back decoded so a caller
+      // never has to double-parse — and so the dashboard can render them without
+      // knowing they were ever text. null = detail never fetched, same as itemsFetchedAt.
+      detailRawJson: row.detailRawJson ? parseJsonLossless(row.detailRawJson) : null,
+      // The payload of a refused suspect re-fetch, decoded the same way. Present
+      // only while this order's stored lines are frozen — see schema.ts.
+      rejectedDetailRawJson: row.rejectedDetailRawJson ? parseJsonLossless(row.rejectedDetailRawJson) : null,
       // `null` and `[]` are different answers and callers must be able to tell them
       // apart: null = the detail call has never succeeded for this order, [] = it did
       // and the platform reported no lines. itemsFetchedAt (already in ...row) says when.
+      // Each item's own rawJson is decoded by getOrderItems for the same reason.
       items: row.itemsFetchedAt ? getOrderItems(row.id) : null,
     };
   });

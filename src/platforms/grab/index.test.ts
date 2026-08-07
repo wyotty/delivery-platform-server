@@ -1,7 +1,9 @@
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { AuthError, PlatformAccount, SessionStore } from '../../core/types.js';
 import { GrabAuthenticator, GrabSession } from './auth.js';
+import { GrabOrder } from './api.js';
 import { GrabConnector } from './index.js';
 
 const account: PlatformAccount = {
@@ -113,6 +115,84 @@ test('a cached session costs no login at all', async () => {
   }
   assert.equal(auth.logins, 0, 'the ordinary night never launches a browser');
   assert.equal(budget.logins, 2);
+});
+
+// ===== the detail phase, end to end =====
+
+const fixture: GrabOrder = JSON.parse(
+  readFileSync(new URL('../../../data/sample-order-details.json', import.meta.url), 'utf8'),
+).orders.find((o: GrabOrder) => o.orderID === '001652323231-C8C3JTXZJGMTTJ');
+
+const statement = {
+  ID: fixture.orderID,
+  currency: { code: 'VND', symbol: '₫', exponent: '0', exponentUnit: 1 },
+  orderEarningsInMinorUnit: 413_534,
+  deliveryStatus: 'COMPLETED',
+  createdAt: '2026-08-05T15:38:16Z',
+  updatedAt: '2026-08-05T16:09:19Z',
+  bookingCode: 'A-9J73HL8GWNW6AV',
+  priceDisplay: '548.000',
+  displayID: '1',
+};
+
+test('the detail response body reaches the order untouched', async (t) => {
+  t.after(() => mock.restoreAll());
+  // The seam the whole feature rests on: whatever Grab answered has to arrive at
+  // UnifiedOrder.detailRawJson as those bytes, because repo.ts stores it as-is.
+  // The two things a re-encode would change are both in this body on purpose — an
+  // int64 orderFlags, and the unicode escape Grab's encoder writes '&' as.
+  const { orderFlags: _rounded, ...fields } = fixture;
+  const body = `{"order":{"orderFlags":4035792627008804869,"note":"a \\u0026 b",${JSON.stringify(fields).slice(1)}}`;
+
+  mock.method(globalThis, 'fetch', async (url: Parameters<typeof fetch>[0]) =>
+    new Response(String(url).includes('daily-pagination') ? JSON.stringify({ statements: [statement] }) : body));
+
+  const connector = new GrabConnector(new FakeAuth());
+  const store = new MemoryStore();
+  await store.set(account.id, { cookies: { session: 'live' }, fetchedAt: Math.floor(Date.now() / 1000) });
+
+  const orders = await connector.fetchOrders(
+    { ...account, config: { itemDetail: { delayMs: 0 } } },
+    { from: '2026-08-05', to: '2026-08-05' },
+    store,
+  );
+
+  assert.equal(orders.length, 1);
+  assert.equal(orders[0].detailRawJson, body, 'byte for byte, not a re-serialization');
+  assert.equal(orders[0].itemsError, undefined);
+  // The projections are still built off the same payload, from the statement's own
+  // declared exponent: '32.000' is 32000 đồng.
+  assert.equal(orders[0].items?.length, 5);
+  assert.equal(orders[0].fare?.deliveryFeeMinor, 32000);
+});
+
+test("the daily statement's own int64 reaches the order unrounded", async (t) => {
+  t.after(() => mock.restoreAll());
+  // The statement is the other half of what gets stored, and it has an orderFlags of
+  // its own. It has no verbatim body to keep — orders.raw_json holds ONE element of
+  // {"statements":[…]} and repo.ts re-serializes it — so the report parse is where
+  // the digits are kept or lost. resp.json() lost them on all 21 statements of a
+  // live day, in the same row as an intact detail payload.
+  const FLAGS = '4035788216077387780'; // live, 001578008445-C8C3KBJWGYE2JN
+  const dailyBody = `{"statements":[{"orderFlags":${FLAGS},${JSON.stringify(statement).slice(1)}]}`;
+
+  mock.method(globalThis, 'fetch', async (url: Parameters<typeof fetch>[0]) =>
+    new Response(String(url).includes('daily-pagination') ? dailyBody : JSON.stringify({ order: fixture })));
+
+  const orders = await new GrabConnector(new FakeAuth()).fetchOrders(
+    { ...account, config: { itemDetail: { delayMs: 0 } } },
+    { from: '2026-08-05', to: '2026-08-05' },
+    new MemoryStore(),
+  );
+
+  assert.equal(orders.length, 1);
+  // JSON.stringify is what repo.ts does to this object on its way into raw_json.
+  assert.match(JSON.stringify(orders[0].rawJson), new RegExp(`"orderFlags":${FLAGS}[,}]`));
+  assert.doesNotMatch(JSON.stringify(orders[0].rawJson), /4035788216077388000/);
+  // …and the ordinary fields the normalizer reads are still ordinary values.
+  assert.equal(orders[0].netAmountMinor, 413_534);
+  assert.equal(orders[0].status, 'completed');
+  assert.equal(orders[0].currency, 'VND');
 });
 
 test('a non-auth error is never spent on a login', async () => {

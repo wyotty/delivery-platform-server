@@ -1,10 +1,13 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pino from 'pino';
 import { UnifiedOrder } from '../core/types.js';
+import { GrabOrder } from '../platforms/grab/api.js';
+import { normalizeOrderFare, normalizeOrderItems } from '../platforms/grab/normalize.js';
+import { parseJsonLossless } from '../core/json.js';
 
 // Point repo at a temp DB BEFORE importing it (repo opens the DB at module load)
 const tmp = mkdtempSync(join(tmpdir(), 'delivery-api-test-'));
@@ -40,8 +43,48 @@ const base: UnifiedOrder = {
   rawJson: {},
 };
 
+// A real captured v3 detail payload, normalized exactly as the connector does, so
+// /orders/:id is exercised against the shape it actually serves. Parked on its own
+// report_date so it cannot move the summary figures the tests below assert on.
+const detail: GrabOrder = JSON.parse(
+  readFileSync(new URL('../../data/sample-order-details.json', import.meta.url), 'utf8'),
+).orders.find((o: GrabOrder) => o.orderID === '001652323231-C8C3JTXZJGMTTJ');
+
+// Grab's own int64 bitfield, off a live response for 001008233253-C8C3AP61CEDHCJ.
+// It sits 131 away from the nearest double, so it is the whole test: any parse and
+// re-serialize on this path turns it into 4035792627008805000 on the way out.
+const ORDER_FLAGS = '4035792627008804869';
+
+// The response body as Grab sends it — the `{"order":{…}}` envelope, and a string,
+// because that is what the connector hands over and what the column stores. The
+// committed fixture went through a JSON.parse of its own, so its orderFlags is
+// already the rounded double: drop it and splice in the literal off the wire.
+const { orderFlags: _rounded, ...detailFields } = detail;
+const detailBody = `{"order":{"orderFlags":${ORDER_FLAGS},${JSON.stringify(detailFields).slice(1)}}`;
+
+// The daily statement has an int64 of its own — a DIFFERENT one, off a live report
+// for 001578008445-C8C3KBJWGYE2JN — and the dialog renders it a few lines from the
+// detail payload. Parsed the way fetchDailyReport hands it over, because raw_json
+// is re-serialized from this object rather than stored as a body.
+const STATEMENT_FLAGS = '4035788216077387780';
+const statement = (parseJsonLossless(
+  `{"statements":[{"ID":"${detail.orderID}","orderFlags":${STATEMENT_FLAGS},"deliveryStatus":"COMPLETED"}]}`,
+) as { statements: unknown[] }).statements[0];
+
+const detailed: UnifiedOrder = {
+  ...base,
+  platformOrderId: detail.orderID,
+  orderedAt: '2026-07-28T10:00:00Z',
+  reportDate: '2026-07-28',
+  rawJson: statement,
+  items: normalizeOrderItems(detail, detail.orderID, 0).items,
+  detailRawJson: detailBody,
+  fare: normalizeOrderFare(detail, 0),
+};
+
 upsertOrders([
   base,
+  detailed,
   // The cross-midnight case: placed late on 07-25 local time, but Grab reports it
   // under 07-26. It must be counted on 07-26, not on the day it was placed.
   { ...base, platformOrderId: 'ORDER-2', orderedAt: '2026-07-25T15:17:24Z', reportDate: '2026-07-26', netAmountMinor: 50_000 },
@@ -145,6 +188,73 @@ test('GET /orders/:id returns the full order with parsed rawJson; 404 when missi
 
   assert.equal((await app.inject({ method: 'GET', url: '/orders/999999' })).statusCode, 404);
   assert.equal((await app.inject({ method: 'GET', url: '/orders/abc' })).statusCode, 400);
+});
+
+test('GET /orders/:id hands back both raw payloads decoded, and the fare in minor units', async () => {
+  const list = await app.inject({ method: 'GET', url: '/orders?from=2026-07-28&to=2026-07-28' });
+  assert.equal(list.json().count, 1);
+  const res = await app.inject({ method: 'GET', url: `/orders/${list.json().orders[0].id}` });
+  assert.equal(res.statusCode, 200);
+  const order = res.json();
+
+  // Objects, never JSON strings: no caller should have to double-parse, and the
+  // dashboard renders them without knowing they were ever text. The whole envelope,
+  // so a key Grab adds beside `order` is served too rather than quietly dropped.
+  assert.equal(typeof order.detailRawJson, 'object');
+  assert.deepEqual(Object.keys(order.detailRawJson), ['order']);
+  const { orderFlags: _served, ...servedOrder } = order.detailRawJson.order;
+  assert.deepEqual(servedOrder, detailFields);
+  assert.equal(order.items.length, 5);
+  assert.deepEqual(order.items.map((i: { rawJson: unknown }) => i.rawJson), detail.itemInfo!.items);
+  assert.equal(typeof order.items[0].rawJson, 'object');
+  // Nothing is scrubbed on the way out any more than on the way in — the fields
+  // the columns ignore are the whole reason the payload is stored.
+  for (const key of ['eater', 'driver', 'times', 'paymentMethod', 'orderChangeLog']) {
+    assert.ok(key in order.detailRawJson.order, key);
+  }
+
+  // The bytes Fastify wrote, not res.json(): the client's own JSON.parse rounds this
+  // field, so parsing the response before checking it would assert nothing. An
+  // int64 that reached the database intact and then got rounded on the way out is
+  // still a wrong number in front of whoever asked for it.
+  //
+  // BOTH raw payloads, because the dialog shows them a few lines apart and each has
+  // its own orderFlags: the detail body, and the daily statement in rawJson, which
+  // reaches this response through a JSON.parse of the column.
+  assert.match(res.body, new RegExp(`"orderFlags":${ORDER_FLAGS}[,}]`));
+  assert.match(res.body, new RegExp(`"orderFlags":${STATEMENT_FLAGS}[,}]`));
+  assert.doesNotMatch(res.body, /4035788216077388000|4035792627008805000/, 'no rounded double anywhere');
+  assert.equal(order.rawJson.ID, detail.orderID, 'and the statement is still an object with readable fields');
+
+  // fare_* arrive already parsed: '32.000' is 32000 đồng, and re-deriving that
+  // client-side is exactly the 1000x bug money.ts exists to prevent.
+  assert.equal(order.fareDeliveryFeeMinor, 32000);
+  assert.equal(order.farePassengerTotalMinor, 580000);
+  assert.equal(order.fareCommissionMinor, 134466);
+  assert.equal(order.fareTaxMinor, 0);                  // a real zero
+  assert.equal(order.farePromotionMinor, null);         // Grab's '-' sentinel
+  assert.equal(order.farePromotionDisplay, '-');        // …still tellable apart
+  assert.equal(order.fareMerchantChargeMinor, null);
+  assert.equal(order.fareMerchantChargeDisplay, '');
+});
+
+test('GET /orders/:id still serves an order whose detail was never fetched', async () => {
+  const list = await app.inject({ method: 'GET', url: '/orders?from=2026-07-27&to=2026-07-27' });
+  const res = await app.inject({ method: 'GET', url: `/orders/${list.json().orders[0].id}` });
+  assert.equal(res.statusCode, 200);
+  const order = res.json();
+
+  assert.equal(order.platformOrderId, 'ORDER-4');
+  // null, not an absent key and not {}: the caller has to be able to tell "never
+  // fetched" from "fetched and empty", the same distinction items already carries.
+  assert.ok('detailRawJson' in order, 'detailRawJson must be present, not an absent key');
+  assert.equal(order.detailRawJson, null);
+  assert.equal(order.rejectedDetailRawJson, null);
+  assert.equal(order.items, null);
+  assert.equal(order.itemsFetchedAt, null);
+  for (const [k, v] of Object.entries(order)) {
+    if (k.startsWith('fare')) assert.equal(v, null, k);
+  }
 });
 
 test('GET /accounts exposes the session state used for needs_human alerting', async () => {

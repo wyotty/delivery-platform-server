@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { desc } from 'drizzle-orm';
+import { desc, eq } from 'drizzle-orm';
 import pino from 'pino';
 import {
   AuthError, DateRange, PlatformAccount, PlatformConnector, SessionStore, UnifiedOrder,
@@ -150,6 +150,77 @@ test('an order whose detail call failed makes the run partial, without an alert'
   assert.equal(lastRun().status, 'partial');
   assert.match(lastRun().errorMessage ?? '', /no item detail.*HTTP 500/);
   assert.deepEqual(notifier.alerts, []);
+});
+
+test('an order that could not be stored makes the run partial, named and alerted', async () => {
+  // Six order-level values bind to a NOT NULL column straight off the payload. One of
+  // them arriving in the wrong shape used to roll back phase 1's whole transaction and
+  // propagate: the run was recorded 'failure' with nothing stored, for every order in
+  // the batch, over one malformed one. Now it costs one order — but it must not cost
+  // it QUIETLY, because there is no row left to notice the absence of.
+  const bad = order(detail('001578008445-C8C3KBJWGYE2JN'), {
+    platformOrderId: '001999999999-UNSTORABLE',
+    currency: { en: 'VND', vi: 'đồng' } as unknown as string,
+    // Its detail call failed too — a night where Grab is changing shapes is rarely
+    // tidy. An order with no row has no lines to be missing, so this must not spend
+    // a second entry in the same alert saying something less useful.
+    items: undefined,
+    itemsError: 'Grab API error: HTTP 500',
+  });
+  staged = async () => [order(detail(ORDER_ID)), bad];
+
+  const notifier = new CollectingNotifier();
+  const result = await fetchAndStore(account, range, store, logger, notifier);
+
+  assert.equal(result.totalOrders, 2, 'two came back');
+  assert.equal(result.orderFailures, 1);
+  assert.equal(result.itemsWritten, 1, 'the other one landed whole, lines and all');
+  assert.equal(result.itemFailures, 0, 'and it is reported once, not once per phase');
+  assert.equal(result.itemsMissing, 0, 'nor as an order whose lines went missing');
+
+  const run = lastRun();
+  assert.equal(run.status, 'partial');
+  assert.equal(run.orderCount, 1, 'order_count is what landed, not what was fetched');
+  assert.match(run.errorMessage ?? '', /could not be stored/);
+  assert.match(run.errorMessage ?? '', /001999999999-UNSTORABLE/);
+  assert.match(run.errorMessage ?? '', /currency is not a currency code/);
+  assert.doesNotMatch(run.errorMessage ?? '', /no item detail/);
+
+  // An order with no row is in no total and no report; nothing else would ever
+  // surface it, and tomorrow's payload is likely to have the same new shape.
+  assert.equal(notifier.alerts.length, 1);
+  assert.match(notifier.alerts[0], /could not store 1 of 2 orders/);
+  assert.match(notifier.alerts[0], /001999999999-UNSTORABLE/);
+  assert.match(notifier.alerts[0], /currency is not a currency code/);
+
+  assert.equal(
+    db.select().from(schema.orders)
+      .where(eq(schema.orders.platformOrderId, '001999999999-UNSTORABLE')).get(),
+    undefined,
+  );
+});
+
+test("a rejected order cannot poison the run's revenue figure", async () => {
+  // The tally has to be taken over what was STORED. An order rejected for an
+  // unreadable net amount is exactly the one whose net amount must not be summed:
+  // `0 + {}` is '0[object Object]', a run summary that is not even a number, and
+  // `0 + '119.600'` is worse — it looks like one.
+  staged = async () => [
+    order(detail(ORDER_ID)), // netAmountMinor 500_000, status completed
+    order(detail('001578008445-C8C3KBJWGYE2JN'), {
+      platformOrderId: '001999999998-BADAMOUNT',
+      netAmountMinor: '119.600' as unknown as number,
+    }),
+  ];
+
+  const notifier = new CollectingNotifier();
+  const result = await fetchAndStore(account, range, store, logger, notifier);
+
+  assert.equal(result.orderFailures, 1);
+  assert.equal(typeof result.revenueMinor, 'number');
+  assert.equal(result.revenueMinor, 500_000);
+  assert.equal(result.completed, 1, 'completed counts what is in the database');
+  assert.match(lastRun().errorMessage ?? '', /netAmountMinor is not a minor-unit integer/);
 });
 
 test('an aborted run still stores its salvaged orders and records the failure', async () => {
