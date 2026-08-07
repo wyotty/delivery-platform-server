@@ -45,7 +45,41 @@ export const orders = sqliteTable('orders', {
   // When line items were last written for this order. NULL = never fetched, or the
   // last detail call failed — which is a different answer from "this order has no
   // items", and both the dashboard and the backfill need to tell them apart.
+  //
+  // Only a SUCCESSFUL write moves it, and a run that skips this order must leave it
+  // alone: it is the answer to "when were these lines last confirmed against the
+  // platform", and stamping it for an order nobody looked at makes that unanswerable.
   itemsFetchedAt: text('items_fetched_at'),
+  // The platform's updated_at AS OF THE PAYLOAD THE STORED LINES CAME FROM — i.e.
+  // which version of this order the rows in order_items describe. Written in the same
+  // statement as items_fetched_at, so it moves only when the lines do.
+  //
+  // This is what makes the incremental fetch self-healing, and it is NOT the same as
+  // updated_at above. updated_at is rewritten from the daily report on every single
+  // tick, whether or not this order's detail call happened or worked; if the skip
+  // decision compared against it, then an order whose detail fetch was aborted, timed
+  // out or hit the deadline would have its "this changed" flag consumed by the very
+  // run that failed to act on it, and its lines would sit one version behind forever.
+  // Comparing the report's updated_at against THIS column instead means the order
+  // keeps asking to be fetched until a fetch actually lands.
+  //   WHERE detail_updated_at IS NOT DISTINCT FROM updated_at   -- lines are current
+  // NULL means no lines were ever stored, or they predate this column.
+  detailUpdatedAt: text('detail_updated_at'),
+  // When the detail phase last ATTEMPTED this order, whatever came of it — a payload
+  // stored, a payload refused, an HTTP 500, an id the endpoint cannot be called with.
+  // NULL = never attempted (a new order, or one written before this column existed).
+  //
+  // Exists only to bound retries. The incremental fetch (core/detail-refresh.ts) skips
+  // an order the platform says has not changed, but an order whose lines are missing
+  // or suspect has to be retried anyway — and at a 3-minute cadence "retry whenever
+  // it still looks wrong" is 480 calls a day at one permanently broken order, plus
+  // an alert each time for the refused ones. This column is the clock that turns that
+  // into a handful.
+  //
+  // items_fetched_at cannot do this job: it is deliberately NOT stamped when a fetch
+  // produced nothing storable, which is exactly the case that needs the cooldown, and
+  // overloading it would destroy the one question it answers.
+  detailAttemptedAt: text('detail_attempted_at'),
   // Why the payload that produced the STORED lines failed the platform's own
   // completeness checks (UnifiedOrder.itemsSuspect); NULL when it passed. Written in
   // the same statement as items_fetched_at, so it always describes the rows that are

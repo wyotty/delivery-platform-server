@@ -13,7 +13,10 @@ import { GrabOrder, GrabStatement } from '../platforms/grab/api.js';
 const tmp = mkdtempSync(join(tmpdir(), 'delivery-test-'));
 process.env.DB_PATH = join(tmp, 'test.db');
 
-const { db, upsertOrders, getOrderItems, DbSessionStore, getSessionState, markSessionNeedsHuman } = await import('./repo.js');
+const {
+  db, upsertOrders, getOrderItems, getStoredOrderDetail,
+  DbSessionStore, getSessionState, markSessionNeedsHuman,
+} = await import('./repo.js');
 const { runMigrations } = await import('./migrate.js');
 const schema = await import('./schema.js');
 
@@ -878,4 +881,151 @@ test('getOrderItems sorts modifiers by position, whatever order the rows sit in'
   const reread = getOrderItems(id)[1];
   assert.deepEqual(reread.modifiers.map(m => m.position), [0, 1, 2, 3, 4]);
   assert.deepEqual(reread.modifiers.map(m => m.name), line.modifiers.map(m => m.name));
+});
+
+// ===== what the incremental fetch reads and writes =====
+//
+// At a 3-minute tick the detail phase must ask the database what it already has and
+// then, for almost every order, do nothing at all. These are the two halves of that:
+// the lookup that feeds the decision, and the guarantee that a skipped order is left
+// alone right down to its timestamps.
+//
+// Own order ids, own business day: these assert on NULL clocks and on rows not moving,
+// which the fixtures above have already written to.
+
+const INC_DAY = '2026-08-09';
+const INC_A = '001000000101-INCAAAAAAAAAA'; // FIVE_LINE's payload
+const INC_B = '001000000102-INCBBBBBBBBBB'; // ITEM_DISCOUNT's
+const INC_C = '001000000103-INCCCCCCCCCCC'; // MULTI_QTY's
+
+/** One order of that day, carrying a real payload under a private id. */
+const inc = (src: GrabOrder, platformOrderId: string, over: Partial<UnifiedOrder> = {}) =>
+  withItems(src, { platformOrderId, reportDate: INC_DAY, updatedAt: '2026-08-09T10:00:00Z', ...over });
+
+test('a line-item write records which version of the order its lines describe', () => {
+  // detail_updated_at is what the skip decision compares the daily report against, so
+  // it has to be the platform timestamp of the payload the stored lines came from —
+  // and it may only move when the lines do.
+  upsertOrders([inc(detail(FIVE_LINE), INC_A)]);
+  assert.equal(orderRow(INC_A).detailUpdatedAt, '2026-08-09T10:00:00Z');
+
+  // The order is edited; a fresh payload lands and the marker follows it.
+  upsertOrders([inc(detail(FIVE_LINE), INC_A, { updatedAt: '2026-08-09T10:31:00Z' })]);
+  assert.equal(orderRow(INC_A).detailUpdatedAt, '2026-08-09T10:31:00Z');
+
+  // The same order upserted with NO payload (a skipped or failed detail call) must not
+  // move it, or the lines would claim to describe a version they were never fetched for.
+  upsertOrders([inc(detail(FIVE_LINE), INC_A, {
+    updatedAt: '2026-08-09T11:00:00Z', items: undefined, detailRawJson: undefined,
+  })]);
+  const row = orderRow(INC_A);
+  assert.equal(row.updatedAt, '2026-08-09T11:00:00Z', 'the report still refreshes the order-level row every tick');
+  assert.equal(row.detailUpdatedAt, '2026-08-09T10:31:00Z', 'but the lines still describe the version they came from');
+});
+
+test('the retry clock moves only for orders the detail phase actually touched', () => {
+  const attempted = inc(detail(ITEM_DISCOUNT), INC_B);
+  const failed = inc(detail(MULTI_QTY), INC_C, { items: undefined, itemsError: 'Grab API error: HTTP 500' });
+  // Neither a payload nor an error: the connector skipped it. Stamping this one would
+  // restart the cooldown it is measured against on every tick, so nothing genuinely
+  // broken would ever come up for retry again.
+  const skipped = inc(detail(FIVE_LINE), '001000000104-INCDDDDDDDDDD', { items: undefined, detailRawJson: undefined });
+
+  upsertOrders([attempted, failed, skipped]);
+
+  assert.notEqual(orderRow(INC_B).detailAttemptedAt, null, 'a payload arrived');
+  assert.notEqual(orderRow(INC_C).detailAttemptedAt, null, 'a call went out and failed');
+  assert.equal(orderRow('001000000104-INCDDDDDDDDDD').detailAttemptedAt, null, 'nobody looked at this one');
+});
+
+test('a skipped order keeps its rows, its items_fetched_at and its clocks', async () => {
+  // The contract the whole feature rests on. "When did we last verify this order"
+  // stops meaning anything the moment a run that skipped the order touches it.
+  const ID = '001000000105-INCEEEEEEEEEE';
+  upsertOrders([inc(detail(MULTI_QTY), ID)]);
+  const id = rowId(ID);
+  const before = orderRow(ID);
+  const beforeItems = itemRows(id);
+  const beforeModifiers = modifierRows(id);
+  assert.ok(before.itemsFetchedAt);
+  assert.equal(beforeItems.length, 2);
+
+  // Enough for a second write to land on a different ISO millisecond, so an
+  // accidental re-stamp cannot pass by looking identical.
+  await new Promise(r => setTimeout(r, 5));
+
+  // The next tick: the daily report still carries this order (its status moved), but
+  // the connector decided its lines are current and sent no payload.
+  const result = upsertOrders([inc(detail(MULTI_QTY), ID, {
+    items: undefined,
+    detailRawJson: undefined,
+    fare: undefined,
+    status: 'cancelled',
+    platformStatus: 'CANCELLED',
+    updatedAt: '2026-08-09T12:00:00Z',
+  })]);
+  assert.equal(result.itemsWritten, 0);
+  assert.deepEqual(result.itemFailures, []);
+
+  const after = orderRow(ID);
+  assert.equal(after.status, 'cancelled', 'the order-level row IS refreshed — that is the cheap half');
+  // …and nothing the detail phase owns moved.
+  assert.equal(after.itemsFetchedAt, before.itemsFetchedAt, 'items_fetched_at still says when the lines were last confirmed');
+  assert.equal(after.detailUpdatedAt, before.detailUpdatedAt);
+  assert.equal(after.detailAttemptedAt, before.detailAttemptedAt);
+  assert.equal(after.detailRawJson, before.detailRawJson, 'the payload the lines came from is still there');
+  assert.equal(after.fareTotalMinor, before.fareTotalMinor, 'and the money parsed out of it');
+  assert.equal(after.itemsSuspect, before.itemsSuspect);
+  // Same rows, same surrogate ids: not deleted and re-inserted with identical values.
+  assert.deepEqual(itemRows(id), beforeItems);
+  assert.deepEqual(modifierRows(id), beforeModifiers);
+});
+
+test('getStoredOrderDetail answers a whole business day, scoped to one account', () => {
+  db.insert(schema.merchants).values({ id: 'merch-2', name: 'Other Merchant' }).onConflictDoNothing().run();
+  db.insert(schema.platformAccounts).values({
+    id: 'acct-2', merchantId: 'merch-2', platform: 'grab', label: 'other', credentialKey: 'k',
+  }).onConflictDoNothing().run();
+
+  const MINE = '001000000106-INCFFFFFFFFFF';
+  const THEIRS = '001000000107-INCGGGGGGGGGG';
+  const OTHER_DAY = '001000000108-INCHHHHHHHHHH';
+  upsertOrders([
+    inc(detail(FIVE_LINE), MINE, { updatedAt: '2026-08-09T13:00:00Z' }),
+    inc(detail(ITEM_DISCOUNT), THEIRS, { accountId: 'acct-2', merchantId: 'merch-2' }),
+    inc(detail(MULTI_QTY), OTHER_DAY, { reportDate: '2026-08-10' }),
+  ]);
+
+  const day = getStoredOrderDetail('acct-1', INC_DAY);
+  assert.ok(day.has(MINE));
+  assert.ok(!day.has(THEIRS), "another account's order is not this account's business");
+  assert.ok(!day.has(OTHER_DAY), 'and neither is another day');
+
+  // Everything the rule needs, and nothing it does not — the ~13 KB payload columns
+  // are never selected, only asked whether they are null.
+  assert.deepEqual(day.get(MINE), {
+    updatedAt: '2026-08-09T13:00:00Z',
+    detailUpdatedAt: '2026-08-09T13:00:00Z',
+    detailAttemptedAt: orderRow(MINE).detailAttemptedAt,
+    itemsSuspect: null,
+    rejected: false,
+  });
+});
+
+test('getStoredOrderDetail reports a frozen order as rejected', () => {
+  // Reached the only way it can be: a suspect payload refused over lines we already
+  // have. That order must keep coming up for retry, so the lookup has to see it.
+  const ID = '001000000109-INCIIIIIIIIII';
+  upsertOrders([inc(detail(FIVE_LINE), ID)]);
+  const truncated = detail(FIVE_LINE);
+  truncated.itemInfo!.items!.length = 3;
+  const refused = inc(truncated, ID, { updatedAt: '2026-08-09T14:00:00Z' });
+  assert.ok(refused.itemsSuspect);
+  assert.equal(upsertOrders([refused]).itemFailures.length, 1);
+
+  const stored = getStoredOrderDetail('acct-1', INC_DAY).get(ID)!;
+  assert.equal(stored.rejected, true);
+  // And it is genuinely stale: the report has moved past what the stored lines describe.
+  assert.equal(stored.updatedAt, '2026-08-09T14:00:00Z');
+  assert.notEqual(stored.detailUpdatedAt, stored.updatedAt);
 });

@@ -1,7 +1,7 @@
 import type { Logger } from 'pino';
 import { getConnector } from './registry.js';
 import { AuthError, DateRange, PlatformAccount, SessionStore, getPartialOrders } from './types.js';
-import { getAccount, logFetchRun, setSessionState, upsertOrders } from '../db/repo.js';
+import { getAccount, getStoredOrderDetail, logFetchRun, setSessionState, upsertOrders } from '../db/repo.js';
 import type { Notifier } from '../notify/index.js';
 
 export interface FetchResult {
@@ -11,6 +11,12 @@ export interface FetchResult {
   revenueMinor: number;
   /** Orders whose line items were (re)written this run. */
   itemsWritten: number;
+  /**
+   * Orders whose detail was not fetched because nothing about them had changed —
+   * no call made, no row touched. On a quiet 3-minute tick this is every order, and
+   * it is the number that says the incremental path is doing its job.
+   */
+  itemsSkipped: number;
   /** Orders whose detail call never produced a payload — stored lines untouched. */
   itemsMissing: number;
   /** Orders that had a payload but whose line-item write was refused or failed. */
@@ -77,9 +83,63 @@ function summarizeFailures(label: string, entries: { platformOrderId: string; er
 }
 
 /**
+ * The identity of a failure, for the alert throttle (see notify/ThrottledNotifier).
+ *
+ * WHICH orders and WHY, sorted — so the same broken order reporting the same reason on
+ * the next tick is recognized as the same condition and stays quiet, while a different
+ * order, or the same one failing a new way, is a new condition and alerts at once.
+ *
+ * Deliberately NOT the message: that carries the date range, which rolls over at
+ * midnight and would un-mute every condition once a day for no reason, and the stored
+ * count, which moves whenever an unrelated order lands.
+ */
+function failureKey(kind: string, accountId: string, entries: { platformOrderId: string; error: string }[]): string {
+  return `${kind}:${accountId}:${entries.map(e => `${e.platformOrderId}=${e.error}`).sort().join('|')}`;
+}
+
+/**
+ * The identity of a free-text error message, with the parts that move on their own
+ * taken out.
+ *
+ * A message is only usable as a throttle key if it is the same string while the
+ * condition is the same condition, and error messages are not written with that in
+ * mind: the login gate's says when it will next try ('next attempt after
+ * 2026-08-07T01:00:00.000Z') and how many failures it has seen, both of which change
+ * while nothing about the situation does. Keyed raw, a broken login alerted ~24 times
+ * a day (measured over a simulated day of 3-minute ticks) — better than 480, and still
+ * not what "alert once" means.
+ *
+ * Every run of digits, deliberately: this has to work on messages nobody here wrote,
+ * including Playwright's. The cost is that 'HTTP 500' and 'HTTP 503' share a key for
+ * one throttle window; both mean "the API is refusing us", the exact text is in
+ * fetch_runs and the log line, and the alternative is a taxonomy of error strings that
+ * would go stale the first time a dependency reworded one.
+ */
+function conditionKey(message: string): string {
+  return message.replace(/\d+/g, '#');
+}
+
+export interface FetchAndStoreOptions {
+  /**
+   * Re-fetch every order's detail, ignoring what is already stored.
+   *
+   * The opt-out from incremental fetching, and the only way to repair rows the store
+   * believes are already correct — after a parser fix, or for orders written before a
+   * column existed. Off by default, deliberately: the scheduled path runs 480 times a
+   * day, and a full re-fetch of a 3-day window there is ~980 calls an hour at a live
+   * merchant — for bytes that have not changed.
+   */
+  force?: boolean;
+}
+
+/**
  * Fetch a date range for one account, persist the orders, and record the run.
- * Auth failures mark the session `needs_human` and raise an alert — without that
- * the scheduler would silently retry a broken login every night forever.
+ *
+ * Auth failures record the session state and raise an alert. Neither is what BOUNDS a
+ * broken login — the connector's process-level login gate is, because this function is
+ * called 480 times a day and each call knows nothing about the last one — but both are
+ * how a human finds out, and the alert is keyed so that "480 times a day" is one
+ * message rather than 480.
  */
 export async function fetchAndStore(
   account: PlatformAccount,
@@ -87,13 +147,21 @@ export async function fetchAndStore(
   sessionStore: SessionStore,
   logger: Logger,
   notifier?: Notifier,
+  opts: FetchAndStoreOptions = {},
 ): Promise<FetchResult> {
   const startedAt = new Date().toISOString();
-  logger.info({ platform: account.platform, accountId: account.id, ...range }, 'Fetching orders');
+  logger.info({ platform: account.platform, accountId: account.id, ...range, force: opts.force === true }, 'Fetching orders');
 
   try {
     const connector = getConnector(account.platform);
-    const orders = await connector.fetchOrders(account, range, sessionStore, { logger });
+    // This is the only place the two halves meet: the connector knows what the
+    // platform just said, the repo knows what we already hold, and the decision that
+    // needs both is a pure function over them (core/detail-refresh.ts). Omitting the
+    // lookup entirely is what --force means — see FetchOrdersOptions.storedDetail.
+    const orders = await connector.fetchOrders(account, range, sessionStore, {
+      logger,
+      storedDetail: opts.force ? undefined : (reportDate => getStoredOrderDetail(account.id, reportDate)),
+    });
     const { orderFailures, itemFailures, stored, itemsWritten } = upsertOrders(orders);
 
     // Revenue = completed orders only; cancelled Grab statements can still carry
@@ -125,6 +193,11 @@ export async function fetchAndStore(
       .filter(o => o.itemsError)
       .map(o => ({ platformOrderId: o.platformOrderId, error: o.itemsError! }));
 
+    // Neither a payload nor an error: the connector decided this order did not need
+    // looking at. Not a shortfall of any kind, so it stays out of `reasons` and out of
+    // the run status — an unchanged order is the expected case, 480 times a day.
+    const itemsSkipped = stored.filter(o => o.items === undefined && o.itemsError === undefined).length;
+
     const reasons: string[] = [];
     if (orderFailures.length > 0) reasons.push(summarizeFailures('order(s) that could not be stored', orderFailures));
     if (itemFailures.length > 0) reasons.push(summarizeFailures('order(s) whose line items could not be written', itemFailures));
@@ -152,11 +225,16 @@ export async function fetchAndStore(
     // headline: a refused item write freezes lines that exist, an unstorable order
     // has no row to freeze. A missing detail call repairs itself tomorrow and alerts
     // for neither.
+    //
+    // Both are conditions rather than events — the same bad order is rediscovered on
+    // every one of the day's 480 runs — so both are keyed for the throttle. Unkeyed,
+    // one unstorable order sent 480 identical Telegram messages a day (measured).
     if (orderFailures.length > 0) {
       await notifier?.alert(
         `🔴 ${account.platform} could not store ${orderFailures.length} of ${orders.length} orders for ${account.merchantName} (${account.id}) — ` +
         `those orders are in no total\n` +
         `Range: ${range.from}..${range.to}\n${summarizeFailures('order(s)', orderFailures)}`,
+        failureKey('orderFailures', account.id, orderFailures),
       );
     }
     if (itemFailures.length > 0) {
@@ -164,11 +242,12 @@ export async function fetchAndStore(
         `⚠️ ${account.platform} stored ${stored.length} orders for ${account.merchantName} (${account.id}), ` +
         `but ${itemFailures.length} could not have their line items written — those lines are now stale\n` +
         `Range: ${range.from}..${range.to}\n${summarizeFailures('order(s)', itemFailures)}`,
+        failureKey('itemFailures', account.id, itemFailures),
       );
     }
 
     logger.info(
-      { totalOrders: orders.length, stored: stored.length, completed: completed.length, revenueMinor, itemsWritten, itemsMissing: missing.length, itemFailures: itemFailures.length, orderFailures: orderFailures.length },
+      { totalOrders: orders.length, stored: stored.length, completed: completed.length, revenueMinor, itemsWritten, itemsSkipped, itemsMissing: missing.length, itemFailures: itemFailures.length, orderFailures: orderFailures.length },
       'Fetch complete',
     );
     return {
@@ -177,6 +256,7 @@ export async function fetchAndStore(
       completed: completed.length,
       revenueMinor,
       itemsWritten,
+      itemsSkipped,
       itemsMissing: missing.length,
       itemFailures: itemFailures.length,
       orderFailures: orderFailures.length,
@@ -224,16 +304,23 @@ export async function fetchAndStore(
       completedAt: new Date().toISOString(),
     });
 
+    // Keyed for the same reason, and it matters most here: a broken login fails every
+    // tick by construction, and the message is identical every time. The login gate is
+    // what stops the retrying; this is what stops the reporting of it. The failure text
+    // is part of the key, so 'session expired' turning into 'login held back — backing
+    // off' is a new thing to say and says it immediately.
     if (err instanceof AuthError) {
       setSessionState(account.id, err.authState);
       await notifier?.alert(
         `🔴 ${account.platform} auth ${err.authState} for ${account.merchantName} (${account.id})\n` +
         `Range: ${range.from}..${range.to}\n${message}`,
+        `auth:${account.id}:${err.authState}:${conditionKey(message)}`,
       );
     } else {
       await notifier?.alert(
         `⚠️ ${account.platform} fetch failed for ${account.merchantName} (${account.id})\n` +
         `Range: ${range.from}..${range.to}\n${message}`,
+        `fetchFailed:${account.id}:${conditionKey(message)}`,
       );
     }
 

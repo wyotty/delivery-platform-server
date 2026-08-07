@@ -9,16 +9,25 @@ const ConfigSchema = z.object({
   dbPath: z.preprocess(blankAsUndefined, z.string().default('data/delivery.db')),
   host: z.preprocess(blankAsUndefined, z.string().default('0.0.0.0')),
   port: z.preprocess(blankAsUndefined, z.coerce.number().int().positive().max(65535).default(3000)),
-  /** node-cron expression for the daily fetch. Default: 02:30 every day. */
-  fetchCron: z.preprocess(blankAsUndefined, z.string().default('30 2 * * *')),
+  /**
+   * node-cron expression for the fetch. Default: every 3 minutes.
+   *
+   * Not nightly any more, and the whole pipeline is tuned to this number: the detail
+   * phase's deadline (120 s) fits inside a tick, the scheduler's in-run retry (5 s)
+   * assumes the next tick is three minutes away, and the login gate and alert throttle
+   * are sized for 480 runs a day. Changing it means revisiting those.
+   */
+  fetchCron: z.preprocess(blankAsUndefined, z.string().default('*/3 * * * *')),
   /** Timezone the cron expression is evaluated in. */
   cronTimezone: z.preprocess(blankAsUndefined, z.string().default('Asia/Ho_Chi_Minh')),
   /** Run the daily fetch once at startup — useful in sandbox, noisy in production. */
   fetchOnBoot: z.preprocess(blankAsUndefined, z.stringbool().default(false)),
   /**
-   * How many days back each nightly run re-fetches. Late cancellations and
-   * refunds land on an already-fetched day, so fetching only yesterday would
-   * miss them; upserts make the overlap idempotent.
+   * How many days back each run re-fetches. Late cancellations and refunds land on an
+   * already-fetched day — measured up to 2 days later on live data — so a narrower
+   * window silently keeps the pre-correction figure; upserts make the overlap
+   * idempotent, and incremental line items make the extra day cost one report request.
+   * See .env.example for the measurement.
    */
   fetchTrailingDays: z.preprocess(blankAsUndefined, z.coerce.number().int().min(0).max(30).default(2)),
   telegramBotToken: z.preprocess(blankAsUndefined, z.string().optional()),

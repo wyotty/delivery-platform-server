@@ -11,7 +11,7 @@ src/
 │   └── grab/        # Playwright auth + API client + normalizer
 ├── mappers/         # UnifiedOrder → @posx/core Invoice (docs/xpos-invoice-mapping.md)
 ├── db/              # Drizzle schema, repo layer
-├── scheduler/       # node-cron nightly fetch (trailing window + retry)
+├── scheduler/       # node-cron fetch every 3 min (trailing window + retry)
 ├── api/             # Fastify REST API + dashboard route
 ├── notify/          # Telegram (grammY) alerting
 ├── config/          # Zod-validated config loader
@@ -32,7 +32,7 @@ npx tsx scripts/seed-merchants.ts
 # built-in `fetch` command that would shadow the script and do nothing)
 pnpm run fetch grab grab-dong-day 2026-07-26
 
-# or run the long-running server: REST API + dashboard + nightly scheduler
+# or run the long-running server: REST API + dashboard + scheduler (every 3 min)
 pnpm start
 ```
 
@@ -80,7 +80,55 @@ docker run --rm --env-file .env -v "$PWD/data:/app/data" \
 | `GET /orders?from=&to=&platform=&limit=` | Order rows |
 | `GET /orders/:id` | Full order incl. raw platform payload |
 | `GET /runs` | Recent fetch runs |
-| `POST /fetch` | Manual backfill: `{accountId, from, to}` |
+| `POST /fetch` | Manual backfill: `{accountId, from, to, force?}` |
+
+### What a fetch actually re-fetches
+
+Order-level data (status, totals, revenue) is **always** re-read for every order in
+the range: that is one daily-report request per day, and it is what keeps the
+dashboard's numbers live.
+
+Line items are a separate request **per order** at ~1 req/sec, and on a settled order
+they return the same bytes every time. So they are fetched only when they need to be:
+the order is new, the platform's `updatedAt` has moved since we last stored it, or the
+lines we hold are missing/stale/doubtful. Anything else is left untouched — no request,
+and not a row changed, including `items_fetched_at`, which goes on meaning "when these
+lines were last confirmed against the platform".
+
+Each run re-reads a trailing window of days (`FETCH_TRAILING_DAYS`, default 2), and
+that width is not decoration: Grab keeps correcting an order after its business day
+closes and serves the correction under the ORIGINAL day's report. Over 315 captured
+statements, 11 orders were updated on a later ICT day and 2 a full two days later —
+one of them a cancellation that takes earnings to 0. A window of 1 never re-reads the
+day those land on, and the pre-correction figure stays in the database forever.
+
+That makes re-running a range nearly free, and a scheduled fetch cheap enough to run
+every 3 minutes (`FETCH_CRON='*/3 * * * *'`, 480 runs a day). When the stored lines are
+*wrong* rather than merely old — after a parser
+fix, say — pass `--force` (CLI) or `"force": true` (`POST /fetch`) to re-fetch every
+order regardless:
+
+```bash
+pnpm cli backfill grab grab-dong-day 2026-06-01 2026-06-30 --force
+```
+
+### What 480 runs a day must not turn into
+
+Every failure this server can see is a *condition*, not an event: the same broken
+order, the same dead session, is rediscovered on every single tick. Three bounds keep
+a persistent problem from becoming a storm, and all three recover on their own — none
+of them needs a human to clear anything.
+
+| Bound | Where | What it stops |
+| --- | --- | --- |
+| Login gate — at most 4 login attempts an account-hour, plus 5/15/60-minute backoff on consecutive failures | `core/login-gate.ts` | Broken cookies cost 1 headless Chromium login per tick (480/day), and a login failing with a plain Playwright error cost 3 per tick (1,440/day). Now ~26/day, and the account recovers by itself when the platform does. |
+| Rowless retry clock — 15 minutes, keyed by account + order id, in process | `core/detail-refresh.ts` (`NoRowRetryLog`) | An order the writer refuses gets no row, so the DB clock that governs every other retry cannot exist for it: its detail was fetched on 480 of 480 ticks with 0 rows ever written. |
+| Alert throttle — one message per condition per 6 hours, with the repeat count on the next one | `notify/index.ts` (`ThrottledNotifier`) | One unstorable order sent 480 identical Telegram messages a day. A *new* condition still alerts immediately; it is the identical one that waits. |
+
+The detail phase also has a hard deadline (`itemDetail.deadlineMs`, 120 s) for the
+whole run rather than for each day of it, so one account cannot hold the scheduler's
+overlap guard past its own tick. A run that does hit it marks the orders it could not
+reach and drains them over the following ticks.
 
 ### Which date do totals use?
 

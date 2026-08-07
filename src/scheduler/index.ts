@@ -21,10 +21,28 @@ export function trailingRange(timezone: string, trailingDays: number, now = new 
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
+/**
+ * In-run retry delays for a scheduled fetch.
+ *
+ * ONE short retry, deliberately. The old [60_000, 300_000] came from a nightly run,
+ * where the next attempt was 24 hours away and sleeping six minutes to catch a blip
+ * was free. At a 3-minute FETCH_CRON THE NEXT TICK IS THE RETRY: six minutes of
+ * sleeping holds the overlap guard through two of them, and each one logs 'Previous
+ * scheduled run still in progress' and is lost — so the backoff does not buy an extra
+ * attempt, it costs two.
+ *
+ * 5 seconds still covers what an in-run retry is actually good for: a single
+ * ECONNRESET, a connection reset by a load balancer, one 502 from a proxy that is
+ * about to be fine. Anything that outlives it is the next tick's problem, three
+ * minutes later, with a clean slate — which is the same thing the old backoff was
+ * trying to be, without holding the scheduler hostage while it waits.
+ */
+export const RETRY_DELAYS_MS = [5_000];
+
 /** Retry with backoff. AuthError never retries — hammering a broken login risks platform lockout. */
 export async function withRetry<T>(
   fn: () => Promise<T>,
-  delaysMs: number[] = [60_000, 300_000],
+  delaysMs: number[] = RETRY_DELAYS_MS,
   sleepFn: (ms: number) => Promise<void> = sleep,
   logger?: Logger,
 ): Promise<T> {
@@ -96,7 +114,12 @@ export function startScheduler(
     throw new Error(`Invalid FETCH_CRON expression: ${config.fetchCron}`);
   }
 
-  let running = false; // ponytail: global overlap guard; per-account locks if runs ever exceed a day
+  // Global overlap guard. At a 3-minute cadence a slow run is skipped, never queued —
+  // which is why the detail phase has a deadline that fits inside a tick, and why the
+  // in-run retry above is five seconds and not six minutes: everything a tick holds is
+  // held at the cost of the ticks behind it. ponytail: per-account locks if one account
+  // ever legitimately needs longer than a tick.
+  let running = false;
   const task = cron.schedule(
     config.fetchCron,
     () => {

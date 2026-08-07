@@ -19,7 +19,11 @@ export class GrabAuthenticator {
    */
   async getCachedSession(account: PlatformAccount, sessionStore: SessionStore): Promise<GrabSession | null> {
     const cached = await sessionStore.get(account.id) as GrabSession | null;
-    if (!cached) return null;
+    // A ROW is not a SESSION. setSessionState writes a placeholder ('{}', fetchedAt 0)
+    // when auth breaks, and that object is truthy, has no cookies, and is not "expired"
+    // by any arithmetic on an undefined timestamp — so it used to be handed out as a
+    // usable session and spent one guaranteed-401 request per tick proving otherwise.
+    if (!cached?.cookies || Object.keys(cached.cookies).length === 0) return null;
     if (!this.isExpired(cached)) return cached;
     if (!await this.validateSession(cached)) return null;
     // COOKIE_MAX_AGE is a guess, and the real session outlives it by many hours —

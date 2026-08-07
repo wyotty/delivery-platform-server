@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AuthError } from '../core/types.js';
-import { trailingRange, withRetry } from './index.js';
+import { RETRY_DELAYS_MS, trailingRange, withRetry } from './index.js';
 
 // 2026-07-25 18:00 UTC = 2026-07-26 01:00 in Asia/Ho_Chi_Minh (UTC+7)
 const now = new Date('2026-07-25T18:00:00Z');
@@ -39,6 +39,30 @@ test('withRetry gives up after exhausting delays', async () => {
     /still down/,
   );
   assert.equal(calls, 2); // initial attempt + one retry
+});
+
+test('the default in-run backoff cannot outlive a tick', async () => {
+  // The old default was [60_000, 300_000]: six minutes of sleeping inside one run. At a
+  // 3-minute cadence that holds the overlap guard through two ticks, each of which logs
+  // 'Previous scheduled run still in progress' and is lost — so the backoff did not buy
+  // an extra attempt, it cost two. THE NEXT TICK IS THE RETRY now; all this has to cover
+  // is a single blip.
+  const sleeps: number[] = [];
+  let calls = 0;
+  await assert.rejects(
+    withRetry(
+      async () => { calls++; throw new Error('ECONNRESET'); },
+      undefined, // the default is the thing under test
+      async ms => { sleeps.push(ms); },
+    ),
+    /ECONNRESET/,
+  );
+
+  const total = sleeps.reduce((a, b) => a + b, 0);
+  assert.ok(total < 180_000, `a run must not sleep past its own tick, slept ${total}ms`);
+  assert.ok(total <= 30_000, `and should be well short of it, slept ${total}ms`);
+  assert.ok(calls >= 2, 'a genuinely transient blip still gets a second chance');
+  assert.deepEqual(sleeps, RETRY_DELAYS_MS);
 });
 
 test('withRetry never retries AuthError — no silent login hammering', async () => {

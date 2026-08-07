@@ -1,5 +1,6 @@
 // src/core/types.ts
 import type { Logger } from 'pino';
+import type { StoredOrderDetail } from './detail-refresh.js';
 
 export type PlatformName = string; // 'grab' | 'foodpanda' | ... (open-ended)
 
@@ -253,6 +254,20 @@ export interface SessionStore {
 /** Optional per-call knobs. An options bag so later additions need no signature change. */
 export interface FetchOrdersOptions {
   logger?: Logger;
+  /**
+   * What the store already knows about one business day's orders, for deciding which
+   * per-order detail calls are worth making — see core/detail-refresh.ts.
+   *
+   * A callback and not a Map so the connector asks once per day, after the day's
+   * report has come back and only when it is actually going to use it. Synchronous
+   * because the only implementation is better-sqlite3, which is; making it a promise
+   * would buy nothing and put an await in the middle of the detail loop.
+   *
+   * ABSENT MEANS FETCH EVERYTHING. That is what keeps `--force` honest and what makes
+   * this addition invisible to any caller that has not opted in: a connector called
+   * without it behaves exactly as it did before incremental fetching existed.
+   */
+  storedDetail?: (reportDate: string) => Map<string, StoredOrderDetail>;
 }
 
 export interface PlatformConnector {

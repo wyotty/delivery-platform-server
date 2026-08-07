@@ -5,6 +5,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import * as schema from './schema.js';
 import { UnifiedOrder, FetchRun, SessionStore, AuthState, OrderFare, OrderItemDiscount } from '../core/types.js';
+import { StoredOrderDetail } from '../core/detail-refresh.js';
 import { parseJsonLossless } from '../core/json.js';
 import { orderLabel, unstorableReason } from '../core/order-guard.js';
 
@@ -130,7 +131,76 @@ export function upsertOrders(orders: UnifiedOrder[]): UpsertOrdersResult {
       });
     }
   }
+  // Phase 3 — the retry clock, for every order the detail phase actually touched.
+  // `items` set means a payload arrived (stored, or refused by the gate above);
+  // `itemsError` set means it did not. Neither is set for an order the connector
+  // skipped, and that is the whole point: a skipped order's clock must not move, or
+  // the cooldown it is being measured against restarts every tick and nothing that is
+  // genuinely broken is ever retried.
+  const attempted = stored.filter(o => o.items !== undefined || o.itemsError !== undefined);
+  if (attempted.length > 0) markDetailAttempted(attempted);
+
   return { orderFailures, itemFailures, stored, itemsWritten };
+}
+
+/**
+ * Stamp detail_attempted_at on orders the detail phase just ran for.
+ *
+ * One statement per order inside one transaction, rather than one UPDATE with an
+ * `IN (…)` list: a `fetch` over a wide range hands this hundreds of orders at once,
+ * and SQLite's default 999-parameter ceiling would turn that into a runtime error on
+ * exactly the path that is meant to be the safe one. Each statement is a lookup on
+ * the unique (platform, platform_order_id) index.
+ */
+function markDetailAttempted(orders: UnifiedOrder[]): void {
+  const attemptedAt = new Date().toISOString();
+  db.transaction(() => {
+    for (const o of orders) {
+      db.update(schema.orders)
+        .set({ detailAttemptedAt: attemptedAt })
+        .where(and(
+          eq(schema.orders.platform, o.platform),
+          eq(schema.orders.platformOrderId, o.platformOrderId),
+        ))
+        .run();
+    }
+  });
+}
+
+/**
+ * Everything the skip decision needs for one business day, in ONE indexed query.
+ *
+ * Keyed on (account_id, report_date), which is exactly idx_orders_account. Not one
+ * SELECT per order: at a 3-minute tick that is ~44 round trips every three minutes for
+ * an answer that is one scan of a handful of rows, and it is the kind of cost that
+ * hides until the day the window widens.
+ *
+ * A missing key means "we have never stored this order", which makes the caller fetch
+ * it. That is the safe direction for every way this lookup can be wrong — a false
+ * miss costs one detail call, a false hit would silently freeze an order's lines.
+ */
+export function getStoredOrderDetail(accountId: string, reportDate: string): Map<string, StoredOrderDetail> {
+  const rows = db.select({
+    platformOrderId: schema.orders.platformOrderId,
+    updatedAt: schema.orders.updatedAt,
+    detailUpdatedAt: schema.orders.detailUpdatedAt,
+    detailAttemptedAt: schema.orders.detailAttemptedAt,
+    itemsSuspect: schema.orders.itemsSuspect,
+    // Only its presence matters, and the column holds up to ~13 KB of payload —
+    // selecting it would pull ~6 MB an hour off disk to compute a boolean.
+    rejected: sql<number>`(${schema.orders.rejectedDetailRawJson} is not null)`,
+  })
+    .from(schema.orders)
+    .where(and(
+      eq(schema.orders.accountId, accountId),
+      eq(schema.orders.reportDate, reportDate),
+    ))
+    .all();
+
+  return new Map(rows.map(({ platformOrderId, rejected, ...rest }) => [
+    platformOrderId,
+    { ...rest, rejected: rejected === 1 },
+  ]));
 }
 
 // ===== Order items =====
@@ -239,6 +309,13 @@ export function replaceOrderItems(order: UnifiedOrder): void {
     db.update(schema.orders)
       .set({
         itemsFetchedAt: new Date().toISOString(),
+        // WHICH version of the order these lines describe — the platform's own
+        // updated_at from the statement this payload was fetched against. In this
+        // statement for the same reason as everything else here: it is only true of
+        // the rows being written right now, and only a write that lands may move it.
+        // The incremental fetch compares the daily report against this column, so an
+        // order whose detail call failed keeps asking to be fetched (see schema.ts).
+        detailUpdatedAt: order.updatedAt,
         // Describes the lines written immediately above, so it is set and cleared
         // with them: the suspect reason lands with a partial payload, and the next
         // clean payload that replaces those lines clears it back to NULL. Anything

@@ -28,6 +28,13 @@ const BackfillBody = z.object({
   accountId: z.string(),
   from: DATE,
   to: DATE,
+  /**
+   * Re-fetch every order's line items instead of only the ones that need it. Same
+   * opt-out as the CLI's --force, and off by default for the same reason: this
+   * endpoint is reachable from the dashboard, and a full re-fetch is ~1 second per
+   * order against a live merchant account.
+   */
+  force: z.boolean().default(false),
 });
 
 // Return type is inferred on purpose: passing a pino instance specialises
@@ -153,12 +160,12 @@ export function buildApi(
     const parsed = BackfillBody.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: z.treeifyError(parsed.error) });
 
-    const { accountId, from, to } = parsed.data;
+    const { accountId, from, to, force } = parsed.data;
     if (from > to) return reply.code(400).send({ error: `from (${from}) is after to (${to})` });
 
     try {
       const account = buildAccount(accountId);
-      const result = await fetchAndStore(account, { from, to }, sessionStore, logger, notifier);
+      const result = await fetchAndStore(account, { from, to }, sessionStore, logger, notifier, { force });
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
